@@ -86,6 +86,9 @@ tableHorz = input.string('Right', '', options = ['Left', 'Center', 'Right'], inl
 dashTextColor = input.color(color.new(#131722, 0), 'Text', group = grpDash, inline = 'color')
 dashBgColor   = input.color(color.new(#ffffff, 0), 'Background', group = grpDash, inline = 'color')
 
+grpGate = 'CISD Gate'
+requireCisdToShow = input.bool(true, 'Only show C2/C3/C4 after CISD confirms', group = grpGate, tooltip = 'When ON, the C2/C3/C4 progression is still tracked internally the whole time, but nothing is drawn on the chart until CISD confirms. If CISD only confirms during C4 and C4 is later invalidated, the whole setup is discarded retroactively.')
+
 //#endregion
 
 //#region [CONSTANTS AND STATE]
@@ -130,7 +133,7 @@ type C2Setup
     float extreme
     int   phase     = 1
     bool  dead      = false
-    label c2Lbl
+    label c2Lbl     = na
     box   c3Box     = na
     line  c3Dash    = na
     float cisdLevel     = na
@@ -145,6 +148,17 @@ type C2Setup
     float c4Top     = na
     float c4Bottom  = na
     bool  c4Invalid = false
+    // --- gating / deferred-draw bookkeeping ---
+    bool  revealed          = false   // true once C2/C3/(C4) have actually been drawn
+    int   c2Bar             = na
+    float c2Price           = na
+    float sweepFromPrice    = na
+    int   sweepFromBar      = na
+    int   c3StartBar        = na
+    int   c4StartBar        = na
+    float c3Top             = na
+    float c3Bottom          = na
+    bool  cisdConfirmedInC4 = false   // true if CISD confirmed while already in phase 2 (C4)
 
 type SetupRecord
     C2Setup setup
@@ -467,27 +481,68 @@ c2Buy         = currentL < prevL1 and currentC > prevL1
 c2Sell        = currentH > prevH1 and currentC < prevH1
 periodChanged = time(autoTf) != time(autoTf)[1]
 
-drawPhase(bool isBull, bool isC4) =>
-    mid   = (state.prevHigh + state.prevLow) / 2
-    top   = math.max(open, mid)
-    bot   = math.min(open, mid)
+// Computes the C3/C4 "T-Spot" top/bottom for the CURRENT bar (always runs,
+// regardless of whether the setup is currently being drawn on the chart).
+computeTopBot() =>
+    mid = (state.prevHigh + state.prevLow) / 2
+    top = math.max(open, mid)
+    bot = math.min(open, mid)
+    [top, bot]
+
+// Actually draws the T-Spot box/dash/(C4 label) using an already-computed
+// top/bot and a given left-edge bar (which may be in the past, i.e. a
+// "backdated" / retroactive draw once CISD finally confirms).
+drawPhaseVisual(bool isBull, bool isC4, int startBar, float top, float bot) =>
     yDash = isBull ? bot : top
     bxCol = isBull ? tSpotBullColor : tSpotBearColor
-    box   bx   = showTSpot ? box.new(bar_index, top, bar_index, bot, border_color = na, bgcolor = bxCol) : na
-    line  dash = showEQ ? line.new(bar_index, yDash, bar_index, yDash, color = eqColor, width = eqWidth, style = lineStyleFromStr(eqStyle)) : na
+    box   bx   = showTSpot ? box.new(startBar, top, bar_index, bot, border_color = na, bgcolor = bxCol) : na
+    line  dash = showEQ ? line.new(startBar, yDash, bar_index, yDash, color = eqColor, width = eqWidth, style = lineStyleFromStr(eqStyle)) : na
     label lbl  = na
     if isC4 and showTSpot and showLabels and validTf
         lbl := directionalLabel(bar_index + 2, isBull ? bot : top, 'C4', isBull)
-    [bx, dash, lbl, top, bot]
+    [bx, dash, lbl]
 
-newSetup(bool isBull, float extreme, label c2Lbl, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar) =>
-    s = C2Setup.new(isBull, extreme, 1, false, c2Lbl)
-    [bx, dash, _, _, _] = drawPhase(isBull, false)
-    s.c3Box     := bx
-    s.c3Dash    := dash
-    s.cisdLevel := cisdLevel
-    s.cisdIndex := cisdIndex
-    if cisdAlreadyConfirmed and not na(cisdLevel) and not na(cisdIndex) and not na(cisdConfirmBar)
+// Draws everything that has accumulated so far for a setup (C2 label, C3
+// box/dash backdated to when C3 actually started, and — if already in C4 —
+// the C4 box/dash/label backdated to when C4 actually started). Called the
+// moment CISD confirms. No-ops if already revealed, or if the gate is off
+// (in which case reveal happens immediately at C2, same as legacy behavior).
+method reveal(C2Setup s) =>
+    if not s.revealed
+        s.revealed := true
+        if validTf and showLabels and not na(s.c2Bar)
+            s.c2Lbl := directionalLabel(s.c2Bar, s.c2Price, 'C2', s.isBull)
+        if not na(s.sweepFromBar)
+            drawSweepLine(s.sweepFromBar, s.sweepFromPrice, bar_index)
+        [bx, dash, _] = drawPhaseVisual(s.isBull, false, s.c3StartBar, s.c3Top, s.c3Bottom)
+        s.c3Box  := bx
+        s.c3Dash := dash
+        if s.phase == 2 and not na(s.c4StartBar)
+            [bx4, dash4, lbl4] = drawPhaseVisual(s.isBull, true, s.c4StartBar, s.c4Top, s.c4Bottom)
+            s.c4Box  := bx4
+            s.c4Dash := dash4
+            s.c4Lbl  := lbl4
+    s
+
+newSetup(bool isBull, float extreme, int extremeBar, float extremePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar) =>
+    s = C2Setup.new(isBull, extreme, 1, false)
+    s.c2Bar          := extremeBar
+    s.c2Price        := extremePrice
+    s.sweepFromPrice := sweepFromPrice
+    s.sweepFromBar   := sweepFromBar
+    s.c3StartBar     := bar_index
+    [top, bot] = computeTopBot()
+    s.c3Top      := top
+    s.c3Bottom   := bot
+    s.cisdLevel  := cisdLevel
+    s.cisdIndex  := cisdIndex
+    cisdReady = cisdAlreadyConfirmed and not na(cisdLevel) and not na(cisdIndex) and not na(cisdConfirmBar)
+    if not requireCisdToShow
+        // legacy behavior: always visible immediately
+        s.reveal()
+    if cisdReady
+        if requireCisdToShow
+            s.reveal()
         confirmCisd(s, cisdConfirmBar)
     registerRecord(s)
     s
@@ -496,12 +551,15 @@ method advanceToC4(C2Setup s) =>
     if not na(s.c3Box)
         box.set_right(s.c3Box, bar_index)
         line.set_x2(s.c3Dash, bar_index)
-    [bx, dash, lbl, top, bot] = drawPhase(s.isBull, true)
-    s.c4Box     := bx
-    s.c4Dash    := dash
-    s.c4Lbl     := lbl
-    s.c4Top     := top
-    s.c4Bottom  := bot
+    s.c4StartBar := bar_index
+    [top, bot] = computeTopBot()
+    s.c4Top    := top
+    s.c4Bottom := bot
+    if s.revealed
+        [bx, dash, lbl] = drawPhaseVisual(s.isBull, true, s.c4StartBar, top, bot)
+        s.c4Box  := bx
+        s.c4Dash := dash
+        s.c4Lbl  := lbl
     s.phase     := 2
     s.c4Invalid := false
     s
@@ -557,34 +615,54 @@ method extendAndCheck(C2Setup s) =>
             s.phase := 0
     s
 
+// If CISD only ever confirmed while in C4 (i.e. it was never valid back in
+// C2/C3), and C4 subsequently gets invalidated, the whole setup — including
+// the CISD confirmation itself — is discarded retroactively.
 method checkC4Invalid(C2Setup s) =>
     if not na(s) and not s.dead and s.phase == 2 and not s.c4Invalid
         invalid = s.isBull ? close[1] < s.c4Bottom : close[1] > s.c4Top
         if invalid
             s.c4Invalid := true
-            if not na(s.c4Lbl)
-                label.set_text(s.c4Lbl, 'XC4')
-                label.set_textcolor(s.c4Lbl, color.red)
-            if not na(s.c4Dash)
-                line.set_color(s.c4Dash, color.red)
-            if not na(s.c4Box)
-                box.delete(s.c4Box)
-                s.c4Box := na
+            if requireCisdToShow and s.cisdConfirmedInC4
+                deleteSetupVisuals(s)
+                s.c2Lbl      := na
+                s.c3Box      := na
+                s.c3Dash     := na
+                s.c4Box      := na
+                s.c4Dash     := na
+                s.c4Lbl      := na
+                s.cisdLine   := na
+                s.cisdLabel  := na
+                s.stdDevData := na
+                s.cisdConfirmed := false
+                s.dead  := true
+                s.phase := 0
+            else
+                if not na(s.c4Lbl)
+                    label.set_text(s.c4Lbl, 'XC4')
+                    label.set_textcolor(s.c4Lbl, color.red)
+                if not na(s.c4Dash)
+                    line.set_color(s.c4Dash, color.red)
+                if not na(s.c4Box)
+                    box.delete(s.c4Box)
+                    s.c4Box := na
     s
 
 method checkCisdConfirm(C2Setup s) =>
     if not na(s) and not s.dead and not s.cisdConfirmed and s.phase != 0 and not na(s.cisdLevel) and not na(s.cisdIndex)
         confirmed = s.isBull ? close > s.cisdLevel : close < s.cisdLevel
         if confirmed
+            if s.phase == 2
+                s.cisdConfirmedInC4 := true
+            if requireCisdToShow
+                s.reveal()
             confirmCisd(s, bar_index)
     s
 
 processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extremeBar, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, C2Setup existing) =>
     C2Setup result = existing
     if trigger and allow
-        label lbl = (validTf and showLabels) ? directionalLabel(extremeBar, extremePrice, 'C2', isBull) : na
-        drawSweepLine(sweepFromBar, sweepFromPrice, bar_index)
-        result := newSetup(isBull, extremePrice, lbl, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar)
+        result := newSetup(isBull, extremePrice, extremeBar, extremePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar)
     else if periodChanged and not na(existing) and not existing.dead
         result := existing.phase == 1 ? existing.advanceToC4() : existing.phase == 2 ? existing.finish() : existing
     result
