@@ -86,13 +86,11 @@ tableHorz = input.string('Right', '', options = ['Left', 'Center', 'Right'], inl
 dashTextColor = input.color(color.new(#131722, 0), 'Text', group = grpDash, inline = 'color')
 dashBgColor   = input.color(color.new(#ffffff, 0), 'Background', group = grpDash, inline = 'color')
 
-grpGate = 'CISD Gate'
-requireCisdToShow = input.bool(true, 'Only show C2/C3/C4 after CISD confirms', group = grpGate, tooltip = 'When ON, the C2/C3/C4 progression is still tracked internally the whole time, but nothing is drawn on the chart until CISD confirms. If CISD only confirms during C4 and C4 is later invalidated, the whole setup is discarded retroactively.')
-
 //#endregion
 
 //#region [CONSTANTS AND STATE]
 
+requireCisdToShow = true
 candleSpacing = 3
 noColor       = color.new(#000000, 100)
 
