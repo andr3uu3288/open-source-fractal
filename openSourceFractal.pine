@@ -8,6 +8,8 @@ showAlerts = input.bool(true, 'Alerts?', group = grpModel, inline = 'alerts', to
 showEarlyCisdAlerts = input.bool(false, 'Early CISD Alerts?', group = grpModel, inline = 'alerts', tooltip = "The global 'Alerts?' toggle above acts as a master switch. If it is OFF, Early CISD alerts will not fire even if this toggle is ON.")
 showHistory = input.int(1, 'History', minval = 0, maxval = 40, group = grpModel, tooltip = 'Number of past setups (valid or invalidated) to keep drawn on the chart. 0 = unlimited.')
 biasFilter = input.string('Neutral', 'Bias', options = ['Neutral', 'Bullish', 'Bearish', 'Auto Bias 1', 'Auto Bias 2', 'Auto Bias Confluence'], group = grpModel, tooltip = 'Auto Bias 1 filters with the active confirmed Fractal Model one alignment higher. Auto Bias 2 references two alignments higher. Auto Bias Confluence requires both higher Fractal Models to be active and aligned in the same direction. Auto modes remain neutral when the required higher model is not active.')
+poiFilter  = input.string('Off', 'POI Filter', options = ['Off', 'Any POI', 'FVG', 'Swing', 'Opposing Candle'], group = grpModel, inline = 'poi', tooltip = 'Optional higher-timeframe context filter. Any POI uses course priority: FVG first, then a confirmed swing high/low, then an opposing-candle body. Off preserves the original setup behavior.')
+poiLookback = input.int(20, 'Lookback', minval = 5, maxval = 50, group = grpModel, inline = 'poi', tooltip = 'Completed higher-timeframe candles searched for a POI that existed before the qualifying C2 sweep began.')
 modelType  = input.string('Auto', 'Fractal', options = ['Custom', 'Auto', '1m-15m', '3m-30m', '5m-1H', '15m-4H', '1H-1D', '4H-1W', '1D-1W'], group = grpModel, inline = 'fractal')
 showEarlyCisd = input.bool(true, 'Early CISD', group = grpModel, inline = 'fractal')
 customLTF  = input.timeframe('5',  'Custom LTF                      ', group = grpModel, inline = 'custom', active = modelType == 'Custom')
@@ -756,6 +758,70 @@ protectedSeriesLevel(bool isBull, int swingOffset) =>
                     break
     level
 
+// Classifies the higher-timeframe point of interest touched by the qualifying
+// sweep. 0=None, 1=FVG, 2=Swing liquidity, 3=Opposing candle. The scan starts
+// from candles that were already complete before the sweep candle began, so a
+// setup can never manufacture its own POI. setupOffset=0 evaluates C2; a true
+// C3 uses setupOffset=1 because the actual liquidity sweep occurred in C2.
+poiClass(bool isBull, int setupOffset, int lookback) =>
+    int result = 0
+    int prevOffset = setupOffset + 1
+    float sweepA = isBull ? low[setupOffset] : high[prevOffset]
+    float sweepB = isBull ? low[prevOffset] : high[setupOffset]
+    float sweepLow = math.min(sweepA, sweepB)
+    float sweepHigh = math.max(sweepA, sweepB)
+
+    // FVG has first priority. A bullish reversal reacts to a bullish FVG;
+    // bearish logic is mirrored. The sweep segment only needs to intersect the
+    // pre-existing imbalance zone.
+    for i = prevOffset to lookback
+        if result == 0
+            if isBull
+                bool fvg = low[i] > high[i + 2]
+                float zoneLow = high[i + 2]
+                float zoneHigh = low[i]
+                if fvg and sweepHigh >= zoneLow and sweepLow <= zoneHigh
+                    result := 1
+            else
+                bool fvg = high[i] < low[i + 2]
+                float zoneLow = high[i]
+                float zoneHigh = low[i + 2]
+                if fvg and sweepHigh >= zoneLow and sweepLow <= zoneHigh
+                    result := 1
+
+    // If no FVG exists on the sweep path, look for a confirmed 3-candle swing
+    // high/low that was known before the sweep candle opened.
+    if result == 0
+        for i = prevOffset + 1 to lookback
+            if result == 0
+                if isBull
+                    bool swingLow = low[i] < low[i + 1] and low[i] < low[i - 1]
+                    if swingLow and low[i] >= sweepLow and low[i] <= sweepHigh
+                        result := 2
+                else
+                    bool swingHigh = high[i] > high[i + 1] and high[i] > high[i - 1]
+                    if swingHigh and high[i] >= sweepLow and high[i] <= sweepHigh
+                        result := 2
+
+    // Course fallback: when neither an FVG nor a swing is present, an older
+    // opposing-candle body can serve as the POI. C1 itself is excluded so that
+    // every reversal is not automatically classified as an opposing-candle POI.
+    if result == 0
+        for i = prevOffset + 1 to lookback
+            if result == 0
+                bool opposing = isBull ? close[i] < open[i] : close[i] > open[i]
+                float zoneLow = math.min(open[i], close[i])
+                float zoneHigh = math.max(open[i], close[i])
+                if opposing and sweepHigh >= zoneLow and sweepLow <= zoneHigh
+                    result := 3
+    result
+
+poiMatches(int cls) =>
+    poiFilter == 'Off' or (poiFilter == 'Any POI' and cls > 0) or (poiFilter == 'FVG' and cls == 1) or (poiFilter == 'Swing' and cls == 2) or (poiFilter == 'Opposing Candle' and cls == 3)
+
+poiLabel(int cls) =>
+    cls == 1 ? 'FVG' : cls == 2 ? 'Swing' : cls == 3 ? 'Opp Candle' : 'None'
+
 autoTf = switch modelType
     '1m-15m' => '15'
     '3m-30m' => '30'
@@ -804,6 +870,11 @@ validTf = modelType == 'Auto' ? isAutoValidTf(tfMins(curTfCode())) : tfMins(curT
 // Protected-series levels are calculated in the HTF context. C2 uses the
 // current HTF candle as the swept swing; true C3 uses the prior HTF C2 swing.
 [bullProtectedC2, bearProtectedC2, bullProtectedC3, bearProtectedC3] = request.security(syminfo.tickerid, autoTf, [protectedSeriesLevel(true, 0), protectedSeriesLevel(false, 0), protectedSeriesLevel(true, 1), protectedSeriesLevel(false, 1)], lookahead = barmerge.lookahead_on)
+
+// POI context is calculated in the HTF itself, then consumed only with [1] on
+// periodChanged below. That freezes the classification to the candle that just
+// closed and prevents a live setup from gaining/losing POI status intrabar.
+[bullPoiC2, bearPoiC2, bullPoiC3, bearPoiC3] = request.security(syminfo.tickerid, autoTf, [poiClass(true, 0, poiLookback), poiClass(false, 0, poiLookback), poiClass(true, 1, poiLookback), poiClass(false, 1, poiLookback)], lookahead = barmerge.lookahead_on)
 
 c2Buy         = currentL < prevL1 and currentC > prevL1
 c2Sell        = currentH > prevH1 and currentC < prevH1
@@ -1237,25 +1308,37 @@ c2SellIdeal = c2SellTrigger and state.prevClose < state.prevOpen and not na(bear
 c3BuyIdeal  = c3BuyTrigger  and not na(bullC3ProtectedLevel) and state.prevClose > bullC3ProtectedLevel
 c3SellIdeal = c3SellTrigger and not na(bearC3ProtectedLevel) and state.prevClose < bearC3ProtectedLevel
 
-if (c2BuyTrigger or c3BuyTrigger) and allowBuy and bullStrictCisd
+// Freeze the POI classification from the same just-closed HTF setup candle.
+// True C3 deliberately uses the C2 sweep classification returned by poiClass(..., 1).
+int bullC2PoiClass = c2BuyTrigger  ? nz(bullPoiC2[1], 0) : 0
+int bearC2PoiClass = c2SellTrigger ? nz(bearPoiC2[1], 0) : 0
+int bullC3PoiClass = c3BuyTrigger  ? nz(bullPoiC3[1], 0) : 0
+int bearC3PoiClass = c3SellTrigger ? nz(bearPoiC3[1], 0) : 0
+
+c2BuyAllow  = allowBuy  and poiMatches(bullC2PoiClass)
+c2SellAllow = allowSell and poiMatches(bearC2PoiClass)
+c3BuyAllow  = allowBuy  and poiMatches(bullC3PoiClass)
+c3SellAllow = allowSell and poiMatches(bearC3PoiClass)
+
+if ((c2BuyTrigger and c2BuyAllow) or (c3BuyTrigger and c3BuyAllow)) and bullStrictCisd
     consumeLastEarlyCisd(bullEarlyCisdRecords)
 
-if (c2SellTrigger or c3SellTrigger) and allowSell and bearStrictCisd
+if ((c2SellTrigger and c2SellAllow) or (c3SellTrigger and c3SellAllow)) and bearStrictCisd
     consumeLastEarlyCisd(bearEarlyCisdRecords)
 
-buySetup  := processC2(c2BuyTrigger, allowBuy, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC2ProtectedLevel, c2BuyIdeal, buySetup)
-sellSetup := processC2(c2SellTrigger, allowSell, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC2ProtectedLevel, c2SellIdeal, sellSetup)
+buySetup  := processC2(c2BuyTrigger, c2BuyAllow, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC2ProtectedLevel, c2BuyIdeal, buySetup)
+sellSetup := processC2(c2SellTrigger, c2SellAllow, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC2ProtectedLevel, c2SellIdeal, sellSetup)
 
 // A true C3 closure uses Candle 2's extreme as the structural invalidation,
 // labels Candle 3 itself, and immediately opens the Candle 4 continuation
 // phase. Candle 1 remains the sweep/reference level for the formation.
-buySetup  := processC3(c3BuyTrigger, allowBuy, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC3ProtectedLevel, c3BuyIdeal, buySetup)
-sellSetup := processC3(c3SellTrigger, allowSell, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC3ProtectedLevel, c3SellIdeal, sellSetup)
+buySetup  := processC3(c3BuyTrigger, c3BuyAllow, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC3ProtectedLevel, c3BuyIdeal, buySetup)
+sellSetup := processC3(c3SellTrigger, c3SellAllow, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC3ProtectedLevel, c3SellIdeal, sellSetup)
 
-markTrigger(c2BuyTrigger, allowBuy, 2, true)
-markTrigger(c2SellTrigger, allowSell, 2, false)
-markTrigger(c3BuyTrigger, allowBuy, 3, true)
-markTrigger(c3SellTrigger, allowSell, 3, false)
+markTrigger(c2BuyTrigger, c2BuyAllow, 2, true)
+markTrigger(c2SellTrigger, c2SellAllow, 2, false)
+markTrigger(c3BuyTrigger, c3BuyAllow, 3, true)
+markTrigger(c3SellTrigger, c3SellAllow, 3, false)
 
 buySetup  := buySetup.extendAndCheck()
 sellSetup := sellSetup.extendAndCheck()
@@ -1266,13 +1349,13 @@ sellSetup := sellSetup.checkC4Invalid()
 // CISD is final at the qualifying HTF close. No later C3/C4 bar can confirm
 // an unconfirmed C2/C3 setup on this strict-timing branch.
 if showAlerts
-    if c2BuyTrigger and allowBuy
+    if c2BuyTrigger and c2BuyAllow
         alert('Bullish C2 formed on ' + syminfo.ticker, alert.freq_once_per_bar)
-    if c2SellTrigger and allowSell
+    if c2SellTrigger and c2SellAllow
         alert('Bearish C2 formed on ' + syminfo.ticker, alert.freq_once_per_bar)
-    if c3BuyTrigger and allowBuy
+    if c3BuyTrigger and c3BuyAllow
         alert('Bullish C3 closure formed on ' + syminfo.ticker, alert.freq_once_per_bar)
-    if c3SellTrigger and allowSell
+    if c3SellTrigger and c3SellAllow
         alert('Bearish C3 closure formed on ' + syminfo.ticker, alert.freq_once_per_bar)
 
 if showVlines and periodChanged
@@ -1335,11 +1418,12 @@ if barstate.islast and boolTable
     confluenceRef1 = biasLtf1 != '' and biasHtf1 != '' ? tfLabel(biasLtf1) + '-' + tfLabel(biasHtf1) : 'Unavailable'
     confluenceRef2 = biasLtf2 != '' and biasHtf2 != '' ? tfLabel(biasLtf2) + '-' + tfLabel(biasHtf2) : 'Unavailable'
     biasDisp = isAutoConfluence ? biasFilter + ' → ' + autoBiasDirStr + '\nAB1 ' + confluenceRef1 + ': ' + autoBias1DirStr + '\nAB2 ' + confluenceRef2 + ': ' + autoBias2DirStr : (isAutoBias1 or isAutoBias2) ? biasFilter + ' → ' + autoBiasDirStr + '\nRef : ' + autoBiasRefStr : biasFilter
-    alignBiasStr = 'Alignment : ' + ltfDisp + '-' + htfDisp + '\n\nBias : ' + biasDisp
+    alignBiasStr = 'Alignment : ' + ltfDisp + '-' + htfDisp + '\n\nBias : ' + biasDisp + '\n\nPOI : ' + poiFilter
     table.cell(wm, 0, 1, alignBiasStr, text_color = dashTextColor, bgcolor = dashBgColor, text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
     dateStr     = str.format_time(time_close, 'dd MMM yyyy', syminfo.timezone)
-    pairDateStr = syminfo.ticker + '  |  ' + dateStr
+    clockStr    = str.format_time(timenow, 'HH:mm:ss', syminfo.timezone)
+    pairDateStr = syminfo.ticker + '  |  ' + dateStr + '  |  ' + clockStr
     table.cell(wm, 0, 2, pairDateStr, text_color = dashTextColor, bgcolor = dashBgColor, text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
     if not validTf
