@@ -113,14 +113,19 @@ type HtfCandle
 type PeriodState
     float prevHigh        = na
     float prevLow         = na
+    float prevClose       = na
     int   prevHighBar     = na
     int   prevLowBar      = na
     float prevPrevHigh    = na
     float prevPrevLow     = na
     int   prevPrevHighBar = na
     int   prevPrevLowBar  = na
+    int   prevPrevPrevHighBar = na
+    int   prevPrevPrevLowBar  = na
     bool  prevC2Buy       = false
     bool  prevC2Sell      = false
+    bool  prevC3Buy       = false
+    bool  prevC3Sell      = false
 
 type StdDevData
     array<line>  lines
@@ -131,6 +136,7 @@ type C2Setup
     float extreme
     int   phase     = 1
     bool  dead      = false
+    int   closureCandle = 2
     label c2Lbl     = na
     box   c3Box     = na
     line  c3Dash    = na
@@ -473,65 +479,86 @@ autoTf = switch modelType
 
 validTf = modelType == 'Auto' ? isAutoValidTf(tfMins(curTfCode())) : tfMins(curTfCode()) <= tfMins(ltfCode())
 
-[currentO, currentH, currentL, currentC, prevH1, prevL1] = request.security(syminfo.tickerid, autoTf, [open[0], high[0], low[0], close[0], high[1], low[1]], lookahead = barmerge.lookahead_on)
+[currentO, currentH, currentL, currentC, prevO1, prevH1, prevL1, prevC1, prevO2, prevH2, prevL2, prevC2] = request.security(syminfo.tickerid, autoTf, [open[0], high[0], low[0], close[0], open[1], high[1], low[1], close[1], open[2], high[2], low[2], close[2]], lookahead = barmerge.lookahead_on)
 
 c2Buy         = currentL < prevL1 and currentC > prevL1
 c2Sell        = currentH > prevH1 and currentC < prevH1
+
+// True Candle 3 Closure (TTFM): Candle 2 first produces a continuation
+// closure through Candle 1 instead of a reversal closure. Candle 3 then
+// reverses without extending the Candle 2 extreme and closes through the
+// full body of Candle 2. The next HTF candle is therefore Candle 4.
+c2BullContinuation = prevL1 < prevL2 and prevC1 < prevL2
+c2BearContinuation = prevH1 > prevH2 and prevC1 > prevH2
+c3Buy = c2BullContinuation and currentL >= prevL1 and currentC > currentO and currentC > math.max(prevO1, prevC1)
+c3Sell = c2BearContinuation and currentH <= prevH1 and currentC < currentO and currentC < math.min(prevO1, prevC1)
+
 periodChanged = time(autoTf) != time(autoTf)[1]
 
-// Computes the C3/C4 "T-Spot" top/bottom for the CURRENT bar (always runs,
-// regardless of whether the setup is currently being drawn on the chart).
-computeTopBot() =>
-    mid = (state.prevHigh + state.prevLow) / 2
-    top = math.max(open, mid)
-    bot = math.min(open, mid)
+// Computes a non-repainting T-Spot from a COMPLETED HTF source candle.
+// The source candle is C2 while C3 is printing, and C3 while C4 is printing.
+// Bearish: source close -> midpoint(high, close).
+// Bullish: midpoint(close, low) -> source close.
+// No value from the currently-printing HTF candle is used.
+computeTSpot(bool isBull, float srcHigh, float srcLow, float srcClose) =>
+    mid = isBull ? (srcClose + srcLow) / 2 : (srcHigh + srcClose) / 2
+    top = isBull ? srcClose : mid
+    bot = isBull ? mid : srcClose
     [top, bot]
 
-// Actually draws the T-Spot box/dash/(C4 label) using an already-computed
-// top/bot and a given left-edge bar (which may be in the past, i.e. a
-// "backdated" / retroactive draw once CISD finally confirms).
-drawPhaseVisual(bool isBull, bool isC4, int startBar, float top, float bot) =>
+// Draws a phase T-Spot from already-frozen prices. Phase visuals are created
+// at the HTF boundary, not retroactively when CISD confirms.
+drawPhaseVisual(bool isBull, bool isC4, int startBar, float top, float bot, bool drawC4Label) =>
     yDash = isBull ? bot : top
     bxCol = isBull ? tSpotBullColor : tSpotBearColor
     box   bx   = showTSpot ? box.new(startBar, top, bar_index, bot, border_color = na, bgcolor = bxCol) : na
     line  dash = showEQ ? line.new(startBar, yDash, bar_index, yDash, color = eqColor, width = eqWidth, style = lineStyleFromStr(eqStyle)) : na
     label lbl  = na
-    if isC4 and showTSpot and showLabels and validTf
-        lbl := directionalLabel(bar_index + 2, isBull ? bot : top, 'C4', isBull)
+    if drawC4Label and isC4 and showTSpot and showLabels and validTf
+        lbl := directionalLabel(startBar + 2, isBull ? bot : top, 'C4', isBull)
     [bx, dash, lbl]
 
-// Draws everything that has accumulated so far for a setup (C2 label, C3
-// box/dash backdated to when C3 actually started, and — if already in C4 —
-// the C4 box/dash/label backdated to when C4 actually started). Called the
-// moment CISD confirms. No-ops if already revealed, or if the gate is off
-// (in which case reveal happens immediately at C2, same as legacy behavior).
+// CISD reveal now controls confirmation labels/sweep only. T-Spot phase
+// visuals are intentionally created at the confirmed HTF boundary so they
+// never appear retroactively after CISD confirms.
 method reveal(C2Setup s) =>
     if not s.revealed
         s.revealed := true
         if validTf and showLabels and not na(s.c2Bar)
-            s.c2Lbl := directionalLabel(s.c2Bar, s.c2Price, 'C2', s.isBull)
+            closureText = s.closureCandle == 3 ? 'C3' : 'C2'
+            s.c2Lbl := directionalLabel(s.c2Bar, s.c2Price, closureText, s.isBull)
         if not na(s.sweepFromBar)
             drawSweepLine(s.sweepFromBar, s.sweepFromPrice, bar_index)
-        [bx, dash, _] = drawPhaseVisual(s.isBull, false, s.c3StartBar, s.c3Top, s.c3Bottom)
-        s.c3Box  := bx
-        s.c3Dash := dash
-        if s.phase == 2 and not na(s.c4StartBar)
-            [bx4, dash4, lbl4] = drawPhaseVisual(s.isBull, true, s.c4StartBar, s.c4Top, s.c4Bottom)
-            s.c4Box  := bx4
-            s.c4Dash := dash4
-            s.c4Lbl  := lbl4
+        if s.phase == 2 and not na(s.c4StartBar) and na(s.c4Lbl) and showTSpot and showLabels and validTf
+            s.c4Lbl := directionalLabel(s.c4StartBar + 2, s.isBull ? s.c4Bottom : s.c4Top, 'C4', s.isBull)
     s
 
-newSetup(bool isBull, float extreme, int extremeBar, float extremePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar) =>
-    s = C2Setup.new(isBull, extreme, 1, false)
-    s.c2Bar          := extremeBar
-    s.c2Price        := extremePrice
+newSetup(bool isBull, int closureCandle, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar) =>
+    startPhase = closureCandle == 3 ? 2 : 1
+    s = C2Setup.new(isBull, invalidationExtreme, startPhase, false, closureCandle)
+    s.c2Bar          := closureBar
+    s.c2Price        := closurePrice
     s.sweepFromPrice := sweepFromPrice
     s.sweepFromBar   := sweepFromBar
-    s.c3StartBar     := bar_index
-    [top, bot] = computeTopBot()
-    s.c3Top      := top
-    s.c3Bottom   := bot
+    // periodChanged has already frozen state.prev* to the completed closure
+    // candle, so these T-Spot bounds cannot change while C3/C4 is printing.
+    [top, bot] = computeTSpot(isBull, state.prevHigh, state.prevLow, state.prevClose)
+    if closureCandle == 3
+        s.c4StartBar := bar_index
+        s.c4Top      := top
+        s.c4Bottom   := bot
+        s.c4Invalid  := false
+        [bx4, dash4, lbl4] = drawPhaseVisual(isBull, true, s.c4StartBar, top, bot, not requireCisdToShow)
+        s.c4Box  := bx4
+        s.c4Dash := dash4
+        s.c4Lbl  := lbl4
+    else
+        s.c3StartBar := bar_index
+        s.c3Top      := top
+        s.c3Bottom   := bot
+        [bx3, dash3, _] = drawPhaseVisual(isBull, false, s.c3StartBar, top, bot, false)
+        s.c3Box  := bx3
+        s.c3Dash := dash3
     s.cisdLevel  := cisdLevel
     s.cisdIndex  := cisdIndex
     cisdReady = cisdAlreadyConfirmed and not na(cisdLevel) and not na(cisdIndex) and not na(cisdConfirmBar)
@@ -548,16 +575,17 @@ newSetup(bool isBull, float extreme, int extremeBar, float extremePrice, float s
 method advanceToC4(C2Setup s) =>
     if not na(s.c3Box)
         box.set_right(s.c3Box, bar_index)
+    if not na(s.c3Dash)
         line.set_x2(s.c3Dash, bar_index)
     s.c4StartBar := bar_index
-    [top, bot] = computeTopBot()
+    // At the C4 boundary state.prev* is the now-completed C3 candle.
+    [top, bot] = computeTSpot(s.isBull, state.prevHigh, state.prevLow, state.prevClose)
     s.c4Top    := top
     s.c4Bottom := bot
-    if s.revealed
-        [bx, dash, lbl] = drawPhaseVisual(s.isBull, true, s.c4StartBar, top, bot)
-        s.c4Box  := bx
-        s.c4Dash := dash
-        s.c4Lbl  := lbl
+    [bx, dash, lbl] = drawPhaseVisual(s.isBull, true, s.c4StartBar, top, bot, s.revealed)
+    s.c4Box  := bx
+    s.c4Dash := dash
+    s.c4Lbl  := lbl
     s.phase     := 2
     s.c4Invalid := false
     s
@@ -565,6 +593,7 @@ method advanceToC4(C2Setup s) =>
 method finish(C2Setup s) =>
     if not na(s.c4Box)
         box.set_right(s.c4Box, bar_index)
+    if not na(s.c4Dash)
         line.set_x2(s.c4Dash, bar_index)
     s.phase := 0
     s
@@ -586,64 +615,61 @@ method extendAndCheck(C2Setup s) =>
         line extDash = s.phase == 1 ? s.c3Dash : s.c4Dash
         if not na(extBox)
             box.set_right(extBox, bar_index)
+        if not na(extDash)
             line.set_x2(extDash, bar_index)
 
-        c2Breach = s.isBull ? low < s.extreme : high > s.extreme
-        if c2Breach
+        closureBreach = s.isBull ? low < s.extreme : high > s.extreme
+        if closureBreach
             if not na(s.c2Lbl)
-                label.set_text(s.c2Lbl, 'XC2')
+                label.set_text(s.c2Lbl, s.closureCandle == 3 ? 'XC3' : 'XC2')
                 label.set_textcolor(s.c2Lbl, s.phase == 2 ? color.orange : color.red)
+            // Preserve already-created T-Spot/EQ phase visuals. Removing them
+            // after a later invalidation makes historical zones disappear and
+            // looks like repainting. The setup is marked dead instead.
             if not na(s.c3Box)
-                box.delete(s.c3Box)
-                s.c3Box := na
+                box.set_right(s.c3Box, bar_index)
             if not na(s.c3Dash)
-                line.delete(s.c3Dash)
-                s.c3Dash := na
+                line.set_x2(s.c3Dash, bar_index)
             if not na(s.c4Box)
-                box.delete(s.c4Box)
-                s.c4Box := na
+                box.set_right(s.c4Box, bar_index)
             if not na(s.c4Dash)
-                line.delete(s.c4Dash)
-                s.c4Dash := na
+                line.set_x2(s.c4Dash, bar_index)
             if not na(s.c4Lbl)
-                label.delete(s.c4Lbl)
-                s.c4Lbl := na
+                label.set_text(s.c4Lbl, 'XC4')
+                label.set_textcolor(s.c4Lbl, color.red)
             s.deleteStdDev()
             s.dead  := true
             s.phase := 0
     s
 
-// If CISD only ever confirmed while in C4 (i.e. it was never valid back in
-// C2/C3), and C4 subsequently gets invalidated, the whole setup — including
-// the CISD confirmation itself — is discarded retroactively.
+// C4 invalidation may invalidate the model, but phase T-Spot history is kept.
+// This avoids deleting already-visible zones after the fact (visual repaint).
 method checkC4Invalid(C2Setup s) =>
     if not na(s) and not s.dead and s.phase == 2 and not s.c4Invalid
         invalid = s.isBull ? close[1] < s.c4Bottom : close[1] > s.c4Top
         if invalid
             s.c4Invalid := true
+            if not na(s.c4Lbl)
+                label.set_text(s.c4Lbl, 'XC4')
+                label.set_textcolor(s.c4Lbl, color.red)
+            if not na(s.c4Dash)
+                line.set_color(s.c4Dash, color.red)
             if requireCisdToShow and s.cisdConfirmedInC4
-                deleteSetupVisuals(s)
-                s.c2Lbl      := na
-                s.c3Box      := na
-                s.c3Dash     := na
-                s.c4Box      := na
-                s.c4Dash     := na
-                s.c4Lbl      := na
-                s.cisdLine   := na
-                s.cisdLabel  := na
-                s.stdDevData := na
+                // Late CISD is still rejected, but only confirmation-specific
+                // drawings are removed. The frozen T-Spot/EQ remains as history.
+                if not na(s.c2Lbl)
+                    label.delete(s.c2Lbl)
+                    s.c2Lbl := na
+                if not na(s.cisdLine)
+                    line.delete(s.cisdLine)
+                    s.cisdLine := na
+                if not na(s.cisdLabel)
+                    label.delete(s.cisdLabel)
+                    s.cisdLabel := na
+                s.deleteStdDev()
                 s.cisdConfirmed := false
                 s.dead  := true
                 s.phase := 0
-            else
-                if not na(s.c4Lbl)
-                    label.set_text(s.c4Lbl, 'XC4')
-                    label.set_textcolor(s.c4Lbl, color.red)
-                if not na(s.c4Dash)
-                    line.set_color(s.c4Dash, color.red)
-                if not na(s.c4Box)
-                    box.delete(s.c4Box)
-                    s.c4Box := na
     s
 
 method checkCisdConfirm(C2Setup s) =>
@@ -660,9 +686,18 @@ method checkCisdConfirm(C2Setup s) =>
 processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extremeBar, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, C2Setup existing) =>
     C2Setup result = existing
     if trigger and allow
-        result := newSetup(isBull, extremePrice, extremeBar, extremePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar)
+        result := newSetup(isBull, 2, extremePrice, extremeBar, extremePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar)
     else if periodChanged and not na(existing) and not existing.dead
         result := existing.phase == 1 ? existing.advanceToC4() : existing.phase == 2 ? existing.finish() : existing
+    result
+
+// Creates a distinct Candle 3 Closure setup. Unlike processC2(), this does
+// not advance an existing setup: it only replaces it when a true C3 closure
+// has just completed. A C3 closure starts directly in the C4 phase.
+processC3(bool trigger, bool allow, bool isBull, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, C2Setup existing) =>
+    C2Setup result = existing
+    if trigger and allow
+        result := newSetup(isBull, 3, invalidationExtreme, closureBar, closurePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar)
     result
 
 markTrigger(bool trigger, bool allow, int idx, bool isBuy) =>
@@ -783,6 +818,7 @@ if periodChanged
         newest             = htfCandles.first()
         state.prevHigh    := newest.h
         state.prevLow     := newest.l
+        state.prevClose   := newest.c
         state.prevHighBar := newest.hBar
         state.prevLowBar  := newest.lBar
     if htfCandles.size() > 1
@@ -791,6 +827,10 @@ if periodChanged
         state.prevPrevLow     := prior.l
         state.prevPrevHighBar := prior.hBar
         state.prevPrevLowBar  := prior.lBar
+    if htfCandles.size() > 2
+        prior2                      = htfCandles.get(2)
+        state.prevPrevPrevHighBar := prior2.hBar
+        state.prevPrevPrevLowBar  := prior2.lBar
     htfCandles.unshift(newHtfCandle())
     while htfCandles.size() > htfCandleCount
         htfCandles.pop().delete()
@@ -816,9 +856,13 @@ if showLH and htfCandles.size() > 0 and hLines.size() > 0
 if periodChanged
     state.prevC2Buy  := c2Buy[1]
     state.prevC2Sell := c2Sell[1]
+    state.prevC3Buy  := c3Buy[1]
+    state.prevC3Sell := c3Sell[1]
 
 c2BuyTrigger  = periodChanged and state.prevC2Buy
 c2SellTrigger = periodChanged and state.prevC2Sell
+c3BuyTrigger  = periodChanged and state.prevC3Buy
+c3SellTrigger = periodChanged and state.prevC3Sell
 
 if c2BuyTrigger and allowBuy and bullReclaimed[1]
     consumeLastEarlyCisd(bullEarlyCisdRecords)
@@ -829,8 +873,16 @@ if c2SellTrigger and allowSell and bearReclaimed[1]
 buySetup  := processC2(c2BuyTrigger, allowBuy, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullLevelFixed[1], bullIndexFixed[1], bullReclaimed[1], bullReclaimBar[1], buySetup)
 sellSetup := processC2(c2SellTrigger, allowSell, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearLevelFixed[1], bearIndexFixed[1], bearReclaimed[1], bearReclaimBar[1], sellSetup)
 
+// A true C3 closure uses Candle 2's extreme as the structural invalidation,
+// labels Candle 3 itself, and immediately opens the Candle 4 continuation
+// phase. Candle 1 remains the sweep/reference level for the formation.
+buySetup  := processC3(c3BuyTrigger, allowBuy, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullLevelFixed[1], bullIndexFixed[1], bullReclaimed[1], bullReclaimBar[1], buySetup)
+sellSetup := processC3(c3SellTrigger, allowSell, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearLevelFixed[1], bearIndexFixed[1], bearReclaimed[1], bearReclaimBar[1], sellSetup)
+
 markTrigger(c2BuyTrigger, allowBuy, 2, true)
 markTrigger(c2SellTrigger, allowSell, 2, false)
+markTrigger(c3BuyTrigger, allowBuy, 3, true)
+markTrigger(c3SellTrigger, allowSell, 3, false)
 
 buySetup  := buySetup.extendAndCheck()
 sellSetup := sellSetup.extendAndCheck()
@@ -846,6 +898,10 @@ if showAlerts
         alert('Bullish C2 formed on ' + syminfo.ticker, alert.freq_once_per_bar)
     if c2SellTrigger and allowSell
         alert('Bearish C2 formed on ' + syminfo.ticker, alert.freq_once_per_bar)
+    if c3BuyTrigger and allowBuy
+        alert('Bullish C3 closure formed on ' + syminfo.ticker, alert.freq_once_per_bar)
+    if c3SellTrigger and allowSell
+        alert('Bearish C3 closure formed on ' + syminfo.ticker, alert.freq_once_per_bar)
 
 if showVlines and periodChanged
     vLines.unshift(line.new(bar_index, low - ta.tr, bar_index, high + ta.tr, xloc.bar_index, extend.both, lineColor, lineStyleFromStr(lineStyle), lineWidth))
