@@ -78,13 +78,26 @@ showIdealLevel     = input.bool(true, 'PS Confirm Level', group = grpVisuals, in
 idealBullColor     = input.color(color.new(color.green, 0), '', group = grpVisuals, inline = 'ideal')
 idealBearColor     = input.color(color.new(color.red, 0), '', group = grpVisuals, inline = 'ideal')
 
+grpTargets       = 'Targets'
+targetMode       = input.string('Off', 'Target Mode', options = ['Off', 'Liquidity', 'Projection', 'Both'], group = grpTargets, inline = 'target', tooltip = 'Liquidity plots the nearest pre-existing confirmed HTF swing in the trade direction. Projection reuses the standard-deviation projection engine. Both shows both target types. Off preserves prior behavior.')
+targetLookback   = input.int(30, 'Lookback', minval = 5, maxval = 100, group = grpTargets, inline = 'target')
+targetExtendBars = input.int(30, 'Bars', minval = 5, maxval = 200, group = grpTargets, inline = 'target2')
+targetColor      = input.color(color.new(color.blue, 0), 'Liquidity', group = grpTargets, inline = 'target2')
+targetStyle      = input.string('Dashed', '', options = ['Solid', 'Dashed', 'Dotted'], group = grpTargets, inline = 'target2')
+targetWidth      = input.int(1, '', minval = 1, maxval = 5, group = grpTargets, inline = 'target2')
+
+grpSession      = 'Session / Time Filter'
+sessionFilter   = input.string('Off', 'Session', options = ['Off', 'London KZ', 'New York AM', 'New York PM', 'Custom'], group = grpSession, inline = 'session', tooltip = 'Optional setup-time filter. It gates only new C2/C3 setups at the qualifying HTF closure boundary and never deletes an already-created historical setup.')
+customSession   = input.session('0930-1200', 'Custom', group = grpSession, inline = 'session2', active = sessionFilter == 'Custom')
+customSessionTz = input.string('America/New_York', 'TZ', options = ['America/New_York', 'Europe/London', 'Etc/UTC', 'Asia/Singapore'], group = grpSession, inline = 'session2', active = sessionFilter == 'Custom')
+
 grpStdDev   = 'Deviations'
 showStdDev  = input.bool(false, 'Enable Projections?', group = grpStdDev, inline = 'stdb')
-stdDevInput = input.string('-1,-2,-3', '', group = grpStdDev, inline = 'stdb', active = showStdDev)
-stdDevCalc  = input.string('Wick', 'Method', options = ['Wick', 'Body'], group = grpStdDev, inline = 'stdb', active = showStdDev)
-stdDevColor = input.color(color.new(#000000, 0), '', group = grpStdDev, inline = 'stdc', active = showStdDev)
-stdDevStyle = input.string('Solid', '', options = ['Solid', 'Dashed', 'Dotted'], group = grpStdDev, inline = 'stdc', active = showStdDev)
-stdDevWidth = input.int(1, '', minval = 1, group = grpStdDev, inline = 'stdc', active = showStdDev)
+stdDevInput = input.string('-1,-2,-3', '', group = grpStdDev, inline = 'stdb', active = showStdDev or targetMode == 'Projection' or targetMode == 'Both')
+stdDevCalc  = input.string('Wick', 'Method', options = ['Wick', 'Body'], group = grpStdDev, inline = 'stdb', active = showStdDev or targetMode == 'Projection' or targetMode == 'Both')
+stdDevColor = input.color(color.new(#000000, 0), '', group = grpStdDev, inline = 'stdc', active = showStdDev or targetMode == 'Projection' or targetMode == 'Both')
+stdDevStyle = input.string('Solid', '', options = ['Solid', 'Dashed', 'Dotted'], group = grpStdDev, inline = 'stdc', active = showStdDev or targetMode == 'Projection' or targetMode == 'Both')
+stdDevWidth = input.int(1, '', minval = 1, group = grpStdDev, inline = 'stdc', active = showStdDev or targetMode == 'Projection' or targetMode == 'Both')
 
 grpDash  = 'Dashboard'
 boolTable = input.bool(true, 'Show Dashboard', group = grpDash)
@@ -177,6 +190,10 @@ type C2Setup
     int   idealMarkBar      = na
     line  protectedLine     = na
     label idealLabel        = na
+    // --- optional frozen liquidity target ---
+    float liquidityTarget   = na
+    line  targetLine        = na
+    label targetLabel       = na
 
 type SetupRecord
     C2Setup setup
@@ -618,7 +635,7 @@ parseFloats(string src) =>
     out
 
 createStdDevProjections(C2Setup s, int confirmBar) =>
-    if showStdDev
+    if showStdDev or targetMode == 'Projection' or targetMode == 'Both'
         devs = parseFloats(stdDevInput)
         if devs.size() > 0
             off     = bar_index - s.cisdIndex
@@ -653,6 +670,14 @@ createStdDevProjections(C2Setup s, int confirmBar) =>
 
             s.stdDevData := StdDevData.new(lns, lbs)
 
+drawLiquidityTarget(C2Setup s, int confirmBar) =>
+    if (targetMode == 'Liquidity' or targetMode == 'Both') and not na(s.liquidityTarget)
+        rightBar = confirmBar + targetExtendBars
+        s.targetLine := line.new(confirmBar, s.liquidityTarget, rightBar, s.liquidityTarget, xloc = xloc.bar_index, color = targetColor, width = targetWidth, style = lineStyleFromStr(targetStyle))
+        if showLabels
+            s.targetLabel := label.new(rightBar, s.liquidityTarget, 'LQ TP', xloc = xloc.bar_index, style = label.style_label_left, color = na, textcolor = targetColor, size = textSize(labelSize), text_font_family = font.family_monospace)
+    s
+
 confirmCisd(C2Setup s, int confirmBar) =>
     s.cisdConfirmed := true
     showLine = s.isBull ? showBullCisd : showBearCisd
@@ -664,6 +689,7 @@ confirmCisd(C2Setup s, int confirmBar) =>
         if showLabels
             s.cisdLabel := label.new(confirmBar + 3, s.cisdLevel, s.isBull ? '+CISD' : '-CISD', xloc = xloc.bar_index, style = label.style_label_left, color = na, textcolor = clr, size = textSize(labelSize), text_font_family = font.family_monospace)
     createStdDevProjections(s, confirmBar)
+    drawLiquidityTarget(s, confirmBar)
 
 deleteSetupVisuals(C2Setup s) =>
     if not na(s)
@@ -687,6 +713,10 @@ deleteSetupVisuals(C2Setup s) =>
             line.delete(s.protectedLine)
         if not na(s.idealLabel)
             label.delete(s.idealLabel)
+        if not na(s.targetLine)
+            line.delete(s.targetLine)
+        if not na(s.targetLabel)
+            label.delete(s.targetLabel)
         if not na(s.stdDevData)
             if not na(s.stdDevData.lines)
                 for ln in s.stdDevData.lines
@@ -822,6 +852,46 @@ poiMatches(int cls) =>
 poiLabel(int cls) =>
     cls == 1 ? 'FVG' : cls == 2 ? 'Swing' : cls == 3 ? 'Opp Candle' : 'None'
 
+// Nearest pre-existing confirmed HTF swing liquidity in the trade direction.
+// A pivot requires both neighboring candles to be completed before the setup
+// candle begins. The chosen level is frozen when the setup is created.
+liquidityTargetLevel(bool isBull, int setupSpan, int lookback) =>
+    float barrier = isBull ? high : low
+    if setupSpan > 0
+        for j = 1 to setupSpan
+            barrier := isBull ? math.max(barrier, high[j]) : math.min(barrier, low[j])
+    float target = na
+    for i = 2 to lookback
+        if isBull
+            bool pivotHigh = high[i] > high[i + 1] and high[i] > high[i - 1]
+            if pivotHigh and high[i] > barrier and (na(target) or high[i] < target)
+                target := high[i]
+        else
+            bool pivotLow = low[i] < low[i + 1] and low[i] < low[i - 1]
+            if pivotLow and low[i] < barrier and (na(target) or low[i] > target)
+                target := low[i]
+    target
+
+activeSessionSpec() =>
+    string sess = ''
+    string tz = 'America/New_York'
+    if sessionFilter == 'London KZ'
+        sess := '0200-0500:23456'
+        tz := 'America/New_York'
+    else if sessionFilter == 'New York AM'
+        sess := '0930-1200:23456'
+        tz := 'America/New_York'
+    else if sessionFilter == 'New York PM'
+        sess := '1330-1600:23456'
+        tz := 'America/New_York'
+    else if sessionFilter == 'Custom'
+        sess := customSession
+        tz := customSessionTz
+    [sess, tz]
+
+[activeSession, activeSessionTz] = activeSessionSpec()
+sessionAllowsSetup = sessionFilter == 'Off' ? true : not na(time(timeframe.period, activeSession, activeSessionTz))
+
 autoTf = switch modelType
     '1m-15m' => '15'
     '3m-30m' => '30'
@@ -875,6 +945,10 @@ validTf = modelType == 'Auto' ? isAutoValidTf(tfMins(curTfCode())) : tfMins(curT
 // periodChanged below. That freezes the classification to the candle that just
 // closed and prevents a live setup from gaining/losing POI status intrabar.
 [bullPoiC2, bearPoiC2, bullPoiC3, bearPoiC3] = request.security(syminfo.tickerid, autoTf, [poiClass(true, 0, poiLookback), poiClass(false, 0, poiLookback), poiClass(true, 1, poiLookback), poiClass(false, 1, poiLookback)], lookahead = barmerge.lookahead_on)
+
+// Liquidity objectives are computed in the HTF context and frozen from the
+// just-closed qualifying candle with [1] at setup creation.
+[bullLiquidityTargetC2, bearLiquidityTargetC2, bullLiquidityTargetC3, bearLiquidityTargetC3] = request.security(syminfo.tickerid, autoTf, [liquidityTargetLevel(true, 0, targetLookback), liquidityTargetLevel(false, 0, targetLookback), liquidityTargetLevel(true, 1, targetLookback), liquidityTargetLevel(false, 1, targetLookback)], lookahead = barmerge.lookahead_on)
 
 c2Buy         = currentL < prevL1 and currentC > prevL1
 c2Sell        = currentH > prevH1 and currentC < prevH1
@@ -948,7 +1022,7 @@ method reveal(C2Setup s) =>
         s.drawIdeal()
     s
 
-newSetup(bool isBull, int closureCandle, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure) =>
+newSetup(bool isBull, int closureCandle, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure, float liquidityTarget) =>
     startPhase = closureCandle == 3 ? 2 : 1
     s = C2Setup.new(isBull, invalidationExtreme, startPhase, false, closureCandle)
     s.c2Bar          := closureBar
@@ -974,9 +1048,10 @@ newSetup(bool isBull, int closureCandle, float invalidationExtreme, int closureB
         [bx3, dash3, _] = drawPhaseVisual(isBull, false, s.c3StartBar, top, bot, false)
         s.c3Box  := bx3
         s.c3Dash := dash3
-    s.cisdLevel      := cisdLevel
-    s.cisdIndex      := cisdIndex
-    s.protectedLevel := protectedLevel
+    s.cisdLevel       := cisdLevel
+    s.cisdIndex       := cisdIndex
+    s.protectedLevel  := protectedLevel
+    s.liquidityTarget := liquidityTarget
     if idealAtClosure
         s.idealFormation := true
         s.idealCandle    := closureCandle
@@ -1086,10 +1161,10 @@ method checkC4Invalid(C2Setup s) =>
                 line.set_color(s.c4Dash, color.red)
     s
 
-processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extremeBar, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure, C2Setup existing) =>
+processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extremeBar, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure, float liquidityTarget, C2Setup existing) =>
     C2Setup result = existing
     if trigger and allow
-        result := newSetup(isBull, 2, extremePrice, extremeBar, extremePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar, protectedLevel, idealAtClosure)
+        result := newSetup(isBull, 2, extremePrice, extremeBar, extremePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar, protectedLevel, idealAtClosure, liquidityTarget)
     else if periodChanged and not na(existing) and not existing.dead
         result := existing.phase == 1 ? existing.advanceToC4() : existing.phase == 2 ? existing.finish() : existing
     result
@@ -1097,10 +1172,10 @@ processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extreme
 // Creates a distinct Candle 3 Closure setup. Unlike processC2(), this does
 // not advance an existing setup: it only replaces it when a true C3 closure
 // has just completed. A C3 closure starts directly in the C4 phase.
-processC3(bool trigger, bool allow, bool isBull, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure, C2Setup existing) =>
+processC3(bool trigger, bool allow, bool isBull, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure, float liquidityTarget, C2Setup existing) =>
     C2Setup result = existing
     if trigger and allow
-        result := newSetup(isBull, 3, invalidationExtreme, closureBar, closurePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar, protectedLevel, idealAtClosure)
+        result := newSetup(isBull, 3, invalidationExtreme, closureBar, closurePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar, protectedLevel, idealAtClosure, liquidityTarget)
     result
 
 markTrigger(bool trigger, bool allow, int idx, bool isBuy) =>
@@ -1315,10 +1390,16 @@ int bearC2PoiClass = c2SellTrigger ? nz(bearPoiC2[1], 0) : 0
 int bullC3PoiClass = c3BuyTrigger  ? nz(bullPoiC3[1], 0) : 0
 int bearC3PoiClass = c3SellTrigger ? nz(bearPoiC3[1], 0) : 0
 
-c2BuyAllow  = allowBuy  and poiMatches(bullC2PoiClass)
-c2SellAllow = allowSell and poiMatches(bearC2PoiClass)
-c3BuyAllow  = allowBuy  and poiMatches(bullC3PoiClass)
-c3SellAllow = allowSell and poiMatches(bearC3PoiClass)
+// Freeze the liquidity objective from the same completed HTF setup candle.
+float bullC2SetupTarget = c2BuyTrigger  ? bullLiquidityTargetC2[1] : na
+float bearC2SetupTarget = c2SellTrigger ? bearLiquidityTargetC2[1] : na
+float bullC3SetupTarget = c3BuyTrigger  ? bullLiquidityTargetC3[1] : na
+float bearC3SetupTarget = c3SellTrigger ? bearLiquidityTargetC3[1] : na
+
+c2BuyAllow  = allowBuy  and poiMatches(bullC2PoiClass) and sessionAllowsSetup
+c2SellAllow = allowSell and poiMatches(bearC2PoiClass) and sessionAllowsSetup
+c3BuyAllow  = allowBuy  and poiMatches(bullC3PoiClass) and sessionAllowsSetup
+c3SellAllow = allowSell and poiMatches(bearC3PoiClass) and sessionAllowsSetup
 
 if ((c2BuyTrigger and c2BuyAllow) or (c3BuyTrigger and c3BuyAllow)) and bullStrictCisd
     consumeLastEarlyCisd(bullEarlyCisdRecords)
@@ -1326,14 +1407,14 @@ if ((c2BuyTrigger and c2BuyAllow) or (c3BuyTrigger and c3BuyAllow)) and bullStri
 if ((c2SellTrigger and c2SellAllow) or (c3SellTrigger and c3SellAllow)) and bearStrictCisd
     consumeLastEarlyCisd(bearEarlyCisdRecords)
 
-buySetup  := processC2(c2BuyTrigger, c2BuyAllow, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC2ProtectedLevel, c2BuyIdeal, buySetup)
-sellSetup := processC2(c2SellTrigger, c2SellAllow, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC2ProtectedLevel, c2SellIdeal, sellSetup)
+buySetup  := processC2(c2BuyTrigger, c2BuyAllow, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC2ProtectedLevel, c2BuyIdeal, bullC2SetupTarget, buySetup)
+sellSetup := processC2(c2SellTrigger, c2SellAllow, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC2ProtectedLevel, c2SellIdeal, bearC2SetupTarget, sellSetup)
 
 // A true C3 closure uses Candle 2's extreme as the structural invalidation,
 // labels Candle 3 itself, and immediately opens the Candle 4 continuation
 // phase. Candle 1 remains the sweep/reference level for the formation.
-buySetup  := processC3(c3BuyTrigger, c3BuyAllow, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC3ProtectedLevel, c3BuyIdeal, buySetup)
-sellSetup := processC3(c3SellTrigger, c3SellAllow, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC3ProtectedLevel, c3SellIdeal, sellSetup)
+buySetup  := processC3(c3BuyTrigger, c3BuyAllow, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC3ProtectedLevel, c3BuyIdeal, bullC3SetupTarget, buySetup)
+sellSetup := processC3(c3SellTrigger, c3SellAllow, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC3ProtectedLevel, c3SellIdeal, bearC3SetupTarget, sellSetup)
 
 markTrigger(c2BuyTrigger, c2BuyAllow, 2, true)
 markTrigger(c2SellTrigger, c2SellAllow, 2, false)
@@ -1417,8 +1498,9 @@ if barstate.islast and boolTable
     autoBiasRefStr = selectedBiasLtf != '' and selectedBiasHtf != '' ? tfLabel(selectedBiasLtf) + '-' + tfLabel(selectedBiasHtf) : 'Unavailable'
     confluenceRef1 = biasLtf1 != '' and biasHtf1 != '' ? tfLabel(biasLtf1) + '-' + tfLabel(biasHtf1) : 'Unavailable'
     confluenceRef2 = biasLtf2 != '' and biasHtf2 != '' ? tfLabel(biasLtf2) + '-' + tfLabel(biasHtf2) : 'Unavailable'
-    biasDisp = isAutoConfluence ? biasFilter + ' → ' + autoBiasDirStr + '\nAB1 ' + confluenceRef1 + ': ' + autoBias1DirStr + '\nAB2 ' + confluenceRef2 + ': ' + autoBias2DirStr : (isAutoBias1 or isAutoBias2) ? biasFilter + ' → ' + autoBiasDirStr + '\nRef : ' + autoBiasRefStr : biasFilter
-    alignBiasStr = 'Alignment : ' + ltfDisp + '-' + htfDisp + '\n\nBias : ' + biasDisp + '\n\nPOI : ' + poiFilter
+    biasDisp = isAutoConfluence ? biasFilter + ' â†’ ' + autoBiasDirStr + '\nAB1 ' + confluenceRef1 + ': ' + autoBias1DirStr + '\nAB2 ' + confluenceRef2 + ': ' + autoBias2DirStr : (isAutoBias1 or isAutoBias2) ? biasFilter + ' â†’ ' + autoBiasDirStr + '\nRef : ' + autoBiasRefStr : biasFilter
+    sessionDisp = sessionFilter == 'Off' ? 'Off' : sessionFilter + (sessionAllowsSetup ? ' â€¢ OPEN' : ' â€¢ CLOSED')
+    alignBiasStr = 'Alignment : ' + ltfDisp + '-' + htfDisp + '\n\nBias : ' + biasDisp + '\n\nPOI : ' + poiFilter + '\nTarget : ' + targetMode + '\nSession : ' + sessionDisp
     table.cell(wm, 0, 1, alignBiasStr, text_color = dashTextColor, bgcolor = dashBgColor, text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
     dateStr     = str.format_time(time_close, 'dd MMM yyyy', syminfo.timezone)
@@ -1428,7 +1510,7 @@ if barstate.islast and boolTable
 
     if not validTf
         curTfStr = tfLabel(curTfCode())
-        warnMsg  = '⚠ Switch to ' + ltfDisp + ' or lower (now: ' + curTfStr + ')'
+        warnMsg  = 'âš  Switch to ' + ltfDisp + ' or lower (now: ' + curTfStr + ')'
         table.cell(wm, 0, 3, warnMsg, text_color = dashBgColor, bgcolor = color.new(#cc0000, 0), text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
 //#endregion
