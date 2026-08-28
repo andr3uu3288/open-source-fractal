@@ -162,7 +162,6 @@ type C2Setup
     int   c4StartBar        = na
     float c3Top             = na
     float c3Bottom          = na
-    bool  cisdConfirmedInC4 = false   // true if CISD confirmed while already in phase 2 (C4)
 
 type SetupRecord
     C2Setup setup
@@ -654,33 +653,6 @@ method checkC4Invalid(C2Setup s) =>
                 label.set_textcolor(s.c4Lbl, color.red)
             if not na(s.c4Dash)
                 line.set_color(s.c4Dash, color.red)
-            if requireCisdToShow and s.cisdConfirmedInC4
-                // Late CISD is still rejected, but only confirmation-specific
-                // drawings are removed. The frozen T-Spot/EQ remains as history.
-                if not na(s.c2Lbl)
-                    label.delete(s.c2Lbl)
-                    s.c2Lbl := na
-                if not na(s.cisdLine)
-                    line.delete(s.cisdLine)
-                    s.cisdLine := na
-                if not na(s.cisdLabel)
-                    label.delete(s.cisdLabel)
-                    s.cisdLabel := na
-                s.deleteStdDev()
-                s.cisdConfirmed := false
-                s.dead  := true
-                s.phase := 0
-    s
-
-method checkCisdConfirm(C2Setup s) =>
-    if not na(s) and not s.dead and not s.cisdConfirmed and s.phase != 0 and not na(s.cisdLevel) and not na(s.cisdIndex)
-        confirmed = s.isBull ? close[1] > s.cisdLevel : close[1] < s.cisdLevel
-        if confirmed
-            if s.phase == 2
-                s.cisdConfirmedInC4 := true
-            if requireCisdToShow
-                s.reveal()
-            confirmCisd(s, bar_index)
     s
 
 processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extremeBar, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, C2Setup existing) =>
@@ -783,31 +755,45 @@ if high == h0 and high > h1
                     bearIndexFixed := bar_index
                 break
 
-var bool bullReclaimed  = false
-var int  bullReclaimBar = na
-var bool bearReclaimed  = false
-var int  bearReclaimBar = na
+var bool bullReclaimed       = false
+var int  bullReclaimBar      = na
+var int  bullLevelHtfTime    = na
+var int  bullReclaimHtfTime  = na
+var bool bearReclaimed       = false
+var int  bearReclaimBar      = na
+var int  bearLevelHtfTime    = na
+var int  bearReclaimHtfTime  = na
 
 bullPeriodSweep = l0 < l1
 bearPeriodSweep = h0 > h1
 
 newBullLevel = not na(bullIndexFixed) and (na(bullIndexFixed[1]) or bullIndexFixed != bullIndexFixed[1])
 if newBullLevel
-    bullReclaimed  := false
-    bullReclaimBar := na
-if not na(bullLevelFixed) and not bullReclaimed and close[1] > bullLevelFixed
-    bullReclaimed  := true
-    bullReclaimBar := bar_index
+    bullReclaimed      := false
+    bullReclaimBar     := na
+    bullReclaimHtfTime := na
+    bullLevelOffset     = bar_index - bullIndexFixed
+    bullLevelHtfTime   := time(autoTf)[bullLevelOffset]
+// Confirm on the actual closed LTF bar. Using close[1] delayed the event by one
+// LTF bar and could operationally move a final-bar CISD into the next HTF candle.
+if barstate.isconfirmed and not na(bullLevelFixed) and not bullReclaimed and close > bullLevelFixed
+    bullReclaimed      := true
+    bullReclaimBar     := bar_index
+    bullReclaimHtfTime := time(autoTf)
     if bullPeriodSweep
         drawEarlyCisd(true, bullLevelFixed, bullIndexFixed, bar_index)
 
 newBearLevel = not na(bearIndexFixed) and (na(bearIndexFixed[1]) or bearIndexFixed != bearIndexFixed[1])
 if newBearLevel
-    bearReclaimed  := false
-    bearReclaimBar := na
-if not na(bearLevelFixed) and not bearReclaimed and close[1] < bearLevelFixed
-    bearReclaimed  := true
-    bearReclaimBar := bar_index
+    bearReclaimed      := false
+    bearReclaimBar     := na
+    bearReclaimHtfTime := na
+    bearLevelOffset     = bar_index - bearIndexFixed
+    bearLevelHtfTime   := time(autoTf)[bearLevelOffset]
+if barstate.isconfirmed and not na(bearLevelFixed) and not bearReclaimed and close < bearLevelFixed
+    bearReclaimed      := true
+    bearReclaimBar     := bar_index
+    bearReclaimHtfTime := time(autoTf)
     if bearPeriodSweep
         drawEarlyCisd(false, bearLevelFixed, bearIndexFixed, bar_index)
 
@@ -864,20 +850,34 @@ c2SellTrigger = periodChanged and state.prevC2Sell
 c3BuyTrigger  = periodChanged and state.prevC3Buy
 c3SellTrigger = periodChanged and state.prevC3Sell
 
-if c2BuyTrigger and allowBuy and bullReclaimed[1]
+// Course-aligned strict CISD ownership: the CISD level and its confirming close
+// must both belong to the HTF candle that just closed. A prior or later HTF
+// candle's CISD cannot validate this C2/C3 closure retroactively.
+qualifyingHtfTime = periodChanged ? time(autoTf)[1] : na
+bullStrictCisd = periodChanged and bullReclaimed[1] and not na(bullReclaimBar[1]) and bullLevelHtfTime[1] == qualifyingHtfTime and bullReclaimHtfTime[1] == qualifyingHtfTime
+bearStrictCisd = periodChanged and bearReclaimed[1] and not na(bearReclaimBar[1]) and bearLevelHtfTime[1] == qualifyingHtfTime and bearReclaimHtfTime[1] == qualifyingHtfTime
+
+bullSetupCisdLevel = bullStrictCisd ? bullLevelFixed[1] : na
+bullSetupCisdIndex = bullStrictCisd ? bullIndexFixed[1] : na
+bullSetupCisdBar   = bullStrictCisd ? bullReclaimBar[1] : na
+bearSetupCisdLevel = bearStrictCisd ? bearLevelFixed[1] : na
+bearSetupCisdIndex = bearStrictCisd ? bearIndexFixed[1] : na
+bearSetupCisdBar   = bearStrictCisd ? bearReclaimBar[1] : na
+
+if (c2BuyTrigger or c3BuyTrigger) and allowBuy and bullStrictCisd
     consumeLastEarlyCisd(bullEarlyCisdRecords)
 
-if c2SellTrigger and allowSell and bearReclaimed[1]
+if (c2SellTrigger or c3SellTrigger) and allowSell and bearStrictCisd
     consumeLastEarlyCisd(bearEarlyCisdRecords)
 
-buySetup  := processC2(c2BuyTrigger, allowBuy, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullLevelFixed[1], bullIndexFixed[1], bullReclaimed[1], bullReclaimBar[1], buySetup)
-sellSetup := processC2(c2SellTrigger, allowSell, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearLevelFixed[1], bearIndexFixed[1], bearReclaimed[1], bearReclaimBar[1], sellSetup)
+buySetup  := processC2(c2BuyTrigger, allowBuy, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, buySetup)
+sellSetup := processC2(c2SellTrigger, allowSell, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, sellSetup)
 
 // A true C3 closure uses Candle 2's extreme as the structural invalidation,
 // labels Candle 3 itself, and immediately opens the Candle 4 continuation
 // phase. Candle 1 remains the sweep/reference level for the formation.
-buySetup  := processC3(c3BuyTrigger, allowBuy, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullLevelFixed[1], bullIndexFixed[1], bullReclaimed[1], bullReclaimBar[1], buySetup)
-sellSetup := processC3(c3SellTrigger, allowSell, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearLevelFixed[1], bearIndexFixed[1], bearReclaimed[1], bearReclaimBar[1], sellSetup)
+buySetup  := processC3(c3BuyTrigger, allowBuy, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, buySetup)
+sellSetup := processC3(c3SellTrigger, allowSell, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, sellSetup)
 
 markTrigger(c2BuyTrigger, allowBuy, 2, true)
 markTrigger(c2SellTrigger, allowSell, 2, false)
@@ -890,9 +890,8 @@ sellSetup := sellSetup.extendAndCheck()
 buySetup  := buySetup.checkC4Invalid()
 sellSetup := sellSetup.checkC4Invalid()
 
-buySetup  := buySetup.checkCisdConfirm()
-sellSetup := sellSetup.checkCisdConfirm()
-
+// CISD is final at the qualifying HTF close. No later C3/C4 bar can confirm
+// an unconfirmed C2/C3 setup on this strict-timing branch.
 if showAlerts
     if c2BuyTrigger and allowBuy
         alert('Bullish C2 formed on ' + syminfo.ticker, alert.freq_once_per_bar)
@@ -965,7 +964,7 @@ if barstate.islast and boolTable
 
     if not validTf
         curTfStr = tfLabel(curTfCode())
-        warnMsg  = '⚠ Switch to ' + ltfDisp + ' or lower (now: ' + curTfStr + ')'
+        warnMsg  = 'âš  Switch to ' + ltfDisp + ' or lower (now: ' + curTfStr + ')'
         table.cell(wm, 0, 3, warnMsg, text_color = dashBgColor, bgcolor = color.new(#cc0000, 0), text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
 //#endregion
