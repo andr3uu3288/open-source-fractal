@@ -7,7 +7,7 @@ grpModel   = 'General Settings'
 showAlerts = input.bool(true, 'Alerts?', group = grpModel, inline = 'alerts', tooltip = "To turn on the alerts, follow these steps:\n\n1) Make sure that the 'Alerts?' toggle is ON.\n2) Find, and click on, the three dots next to the indicator title on the top left of your chart, or right-click on the indicator on the chart.\n3) Click 'Add Alert on Fractal Model [Pro+]'\n4) Choose the Alert Name, if you wish, and confirm by clicking 'Create'")
 showEarlyCisdAlerts = input.bool(false, 'Early CISD Alerts?', group = grpModel, inline = 'alerts', tooltip = "The global 'Alerts?' toggle above acts as a master switch. If it is OFF, Early CISD alerts will not fire even if this toggle is ON.")
 showHistory = input.int(1, 'History', minval = 0, maxval = 40, group = grpModel, tooltip = 'Number of past setups (valid or invalidated) to keep drawn on the chart. 0 = unlimited.')
-biasFilter = input.string('Neutral', 'Bias', options = ['Neutral', 'Bullish', 'Bearish', 'Auto Bias 1', 'Auto Bias 2'], group = grpModel, tooltip = 'Auto Bias 1 filters with the active confirmed Fractal Model one alignment higher. Auto Bias 2 references two alignments higher. Auto modes remain neutral when no higher model is active.')
+biasFilter = input.string('Neutral', 'Bias', options = ['Neutral', 'Bullish', 'Bearish', 'Auto Bias 1', 'Auto Bias 2', 'Auto Bias Confluence'], group = grpModel, tooltip = 'Auto Bias 1 filters with the active confirmed Fractal Model one alignment higher. Auto Bias 2 references two alignments higher. Auto Bias Confluence requires both higher Fractal Models to be active and aligned in the same direction. Auto modes remain neutral when the required higher model is not active.')
 modelType  = input.string('Auto', 'Fractal', options = ['Custom', 'Auto', '1m-15m', '3m-30m', '5m-1H', '15m-4H', '1H-1D', '4H-1W', '1D-1W'], group = grpModel, inline = 'fractal')
 showEarlyCisd = input.bool(true, 'Early CISD', group = grpModel, inline = 'fractal')
 customLTF  = input.timeframe('5',  'Custom LTF                      ', group = grpModel, inline = 'custom', active = modelType == 'Custom')
@@ -772,22 +772,30 @@ autoTf = switch modelType
 
 isAutoBias1 = biasFilter == 'Auto Bias 1'
 isAutoBias2 = biasFilter == 'Auto Bias 2'
+isAutoConfluence = biasFilter == 'Auto Bias Confluence'
 selectedBiasLtf = isAutoBias1 ? biasLtf1 : isAutoBias2 ? biasLtf2 : ''
 selectedBiasHtf = isAutoBias1 ? biasHtf1 : isAutoBias2 ? biasHtf2 : ''
 
-// Evaluate only the Auto Bias level the user actually selected. This avoids
-// running two independent higher-fractal engines on every chart. lookahead_off
-// exposes only completed reference-LTF states, while calc_bars_count bounds the
-// historical workload without changing current bias behavior.
-int selectedAutoBiasDir = 0
-if (isAutoBias1 or isAutoBias2) and selectedBiasLtf != '' and selectedBiasHtf != ''
-    selectedAutoBiasDir := request.security(syminfo.tickerid, selectedBiasLtf, fractalBiasEngine(selectedBiasHtf), lookahead = barmerge.lookahead_off, calc_bars_count = 300)
+// Auto Bias 1/2 keep the Task-4 selected-engine-only optimization. Confluence
+// intentionally evaluates both higher Fractal Models because agreement between
+// those two independent structures is the filter. Each engine remains bounded
+// and uses lookahead_off so no future higher-fractal state is exposed.
+int autoBias1Dir = 0
+int autoBias2Dir = 0
+if (isAutoBias1 or isAutoConfluence) and biasLtf1 != '' and biasHtf1 != ''
+    autoBias1Dir := request.security(syminfo.tickerid, biasLtf1, fractalBiasEngine(biasHtf1), lookahead = barmerge.lookahead_off, calc_bars_count = 300)
+if (isAutoBias2 or isAutoConfluence) and biasLtf2 != '' and biasHtf2 != ''
+    autoBias2Dir := request.security(syminfo.tickerid, biasLtf2, fractalBiasEngine(biasHtf2), lookahead = barmerge.lookahead_off, calc_bars_count = 300)
 
-// Manual behavior remains unchanged. Auto modes permit setups only when an
-// active higher-fractal model exists in the same direction; neutral auto bias
-// intentionally suppresses both sides.
-allowBuy = biasFilter == 'Neutral' or biasFilter == 'Bullish' or ((isAutoBias1 or isAutoBias2) and selectedAutoBiasDir == 1)
-allowSell = biasFilter == 'Neutral' or biasFilter == 'Bearish' or ((isAutoBias1 or isAutoBias2) and selectedAutoBiasDir == -1)
+confluenceBiasDir = autoBias1Dir == 1 and autoBias2Dir == 1 ? 1 : autoBias1Dir == -1 and autoBias2Dir == -1 ? -1 : 0
+selectedAutoBiasDir = isAutoBias1 ? autoBias1Dir : isAutoBias2 ? autoBias2Dir : isAutoConfluence ? confluenceBiasDir : 0
+
+// Manual behavior remains unchanged. Single Auto modes require their selected
+// higher model. Confluence is stricter: both higher models must be active and
+// point in the same direction; disagreement or Neutral on either side blocks
+// new lower-fractal setups.
+allowBuy = biasFilter == 'Neutral' or biasFilter == 'Bullish' or ((isAutoBias1 or isAutoBias2) and selectedAutoBiasDir == 1) or (isAutoConfluence and confluenceBiasDir == 1)
+allowSell = biasFilter == 'Neutral' or biasFilter == 'Bearish' or ((isAutoBias1 or isAutoBias2) and selectedAutoBiasDir == -1) or (isAutoConfluence and confluenceBiasDir == -1)
 
 validTf = modelType == 'Auto' ? isAutoValidTf(tfMins(curTfCode())) : tfMins(curTfCode()) <= tfMins(ltfCode())
 
@@ -1321,8 +1329,12 @@ if barstate.islast and boolTable
     table.cell(wm, 0, 0, 'Open Source Fractal', text_color = dashBgColor, bgcolor = dashTextColor, text_size = size.normal, text_halign = text.align_center, text_font_family = font.family_default)
 
     autoBiasDirStr = selectedAutoBiasDir == 1 ? 'Bullish' : selectedAutoBiasDir == -1 ? 'Bearish' : 'Neutral'
+    autoBias1DirStr = autoBias1Dir == 1 ? 'Bullish' : autoBias1Dir == -1 ? 'Bearish' : 'Neutral'
+    autoBias2DirStr = autoBias2Dir == 1 ? 'Bullish' : autoBias2Dir == -1 ? 'Bearish' : 'Neutral'
     autoBiasRefStr = selectedBiasLtf != '' and selectedBiasHtf != '' ? tfLabel(selectedBiasLtf) + '-' + tfLabel(selectedBiasHtf) : 'Unavailable'
-    biasDisp = (isAutoBias1 or isAutoBias2) ? biasFilter + ' → ' + autoBiasDirStr + '\nRef : ' + autoBiasRefStr : biasFilter
+    confluenceRef1 = biasLtf1 != '' and biasHtf1 != '' ? tfLabel(biasLtf1) + '-' + tfLabel(biasHtf1) : 'Unavailable'
+    confluenceRef2 = biasLtf2 != '' and biasHtf2 != '' ? tfLabel(biasLtf2) + '-' + tfLabel(biasHtf2) : 'Unavailable'
+    biasDisp = isAutoConfluence ? biasFilter + ' → ' + autoBiasDirStr + '\nAB1 ' + confluenceRef1 + ': ' + autoBias1DirStr + '\nAB2 ' + confluenceRef2 + ': ' + autoBias2DirStr : (isAutoBias1 or isAutoBias2) ? biasFilter + ' → ' + autoBiasDirStr + '\nRef : ' + autoBiasRefStr : biasFilter
     alignBiasStr = 'Alignment : ' + ltfDisp + '-' + htfDisp + '\n\nBias : ' + biasDisp
     table.cell(wm, 0, 1, alignBiasStr, text_color = dashTextColor, bgcolor = dashBgColor, text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
