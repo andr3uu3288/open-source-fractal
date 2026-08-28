@@ -964,7 +964,7 @@ if barstate.islast and boolTable
 
     if not validTf
         curTfStr = tfLabel(curTfCode())
-        warnMsg  = 'âš  Switch to ' + ltfDisp + ' or lower (now: ' + curTfStr + ')'
+        warnMsg  = '⚠ Switch to ' + ltfDisp + ' or lower (now: ' + curTfStr + ')'
         table.cell(wm, 0, 3, warnMsg, text_color = dashBgColor, bgcolor = color.new(#cc0000, 0), text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
 //#endregion
