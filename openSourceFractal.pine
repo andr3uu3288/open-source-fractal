@@ -7,7 +7,7 @@ grpModel   = 'General Settings'
 showAlerts = input.bool(true, 'Alerts?', group = grpModel, inline = 'alerts', tooltip = "To turn on the alerts, follow these steps:\n\n1) Make sure that the 'Alerts?' toggle is ON.\n2) Find, and click on, the three dots next to the indicator title on the top left of your chart, or right-click on the indicator on the chart.\n3) Click 'Add Alert on Fractal Model [Pro+]'\n4) Choose the Alert Name, if you wish, and confirm by clicking 'Create'")
 showEarlyCisdAlerts = input.bool(false, 'Early CISD Alerts?', group = grpModel, inline = 'alerts', tooltip = "The global 'Alerts?' toggle above acts as a master switch. If it is OFF, Early CISD alerts will not fire even if this toggle is ON.")
 showHistory = input.int(1, 'History', minval = 0, maxval = 40, group = grpModel, tooltip = 'Number of past setups (valid or invalidated) to keep drawn on the chart. 0 = unlimited.')
-biasFilter = input.string('Neutral', 'Bias', options = ['Neutral', 'Bullish', 'Bearish'], group = grpModel)
+biasFilter = input.string('Neutral', 'Bias', options = ['Neutral', 'Bullish', 'Bearish', 'Auto Bias 1', 'Auto Bias 2'], group = grpModel, tooltip = 'Auto Bias 1 filters with the active confirmed Fractal Model one alignment higher. Auto Bias 2 references two alignments higher. Auto modes remain neutral when no higher model is active.')
 modelType  = input.string('Auto', 'Fractal', options = ['Custom', 'Auto', '1m-15m', '3m-30m', '5m-1H', '15m-4H', '1H-1D', '4H-1W', '1D-1W'], group = grpModel, inline = 'fractal')
 showEarlyCisd = input.bool(true, 'Early CISD', group = grpModel, inline = 'fractal')
 customLTF  = input.timeframe('5',  'Custom LTF                      ', group = grpModel, inline = 'custom', active = modelType == 'Custom')
@@ -198,9 +198,6 @@ var array<EarlyCisdRecord>   bearEarlyCisdRecords = array.new<EarlyCisdRecord>()
 var int                      htfOpenBar           = na
 var line                     htfOpenLn            = na
 
-allowBuy  = biasFilter != 'Bearish'
-allowSell = biasFilter != 'Bullish'
-
 //#endregion
 
 //#region [FUNCTIONS]
@@ -305,6 +302,229 @@ ltfCode() =>
         =>          curTfCode()
 
 isAutoValidTf(int mins) => mins == 1 or mins == 3 or mins == 5 or mins == 15 or mins == 60 or mins == 240 or mins == 1440
+
+// Returns the next standard Fractal Model alignment above a selected HTF.
+// Example: 5m-1H -> 15m-4H -> 1H-1D.
+nextBiasPair(string htf) =>
+    string nextLtf = ''
+    string nextHtf = ''
+    if htf == '15'
+        nextLtf := '5'
+        nextHtf := '60'
+    else if htf == '30'
+        // 3m-30m is an extra alignment in this open-source script. Its next
+        // higher canonical Fractal Model is 5m-1H, not 15m-4H.
+        nextLtf := '5'
+        nextHtf := '60'
+    else if htf == '60'
+        nextLtf := '15'
+        nextHtf := '240'
+    else if htf == '240'
+        nextLtf := '60'
+        nextHtf := '1D'
+    else if htf == '1D' or htf == 'D'
+        nextLtf := '240'
+        nextHtf := '1W'
+    else if htf == '1W' or htf == 'W'
+        nextLtf := '1D'
+        nextHtf := '1M'
+    [nextLtf, nextHtf]
+
+// Compact non-drawing Fractal Model engine used only by Auto Bias.
+// It executes in the reference model's LTF context via request.security().
+// A confirmed C2 supplies bias through C3/C4; a true C3 supplies bias through
+// C4. The model is neutral after its continuation window finishes or if its
+// structural invalidation extreme is breached. All model changes occur from
+// completed reference-HTF candles and strict same-candle CISD confirmation.
+fractalBiasEngine(string refHtf) =>
+    bool periodChanged = time(refHtf) != time(refHtf)[1]
+
+    var float curO = na
+    var float curH = na
+    var float curL = na
+    var float curC = na
+    var float prevO1 = na
+    var float prevH1 = na
+    var float prevL1 = na
+    var float prevC1 = na
+    var float prevO2 = na
+    var float prevH2 = na
+    var float prevL2 = na
+    var float prevC2 = na
+
+    var float bullLevel = na
+    var int   bullIndex = na
+    var float bearLevel = na
+    var int   bearIndex = na
+    var bool  bullReclaimed = false
+    var bool  bearReclaimed = false
+    var int   bullLevelHtfTime = na
+    var int   bearLevelHtfTime = na
+    var int   bullReclaimHtfTime = na
+    var int   bearReclaimHtfTime = na
+
+    var int   biasDir = 0       // 1 bullish, -1 bearish, 0 neutral
+    var int   modelPhase = 0    // 1 = C3, 2 = C4
+    var float modelExtreme = na
+
+    if na(curO)
+        curO := open
+        curH := high
+        curL := low
+        curC := close
+    else if periodChanged
+        // cur* is the HTF candle that has just completed. prev1/prev2 are the
+        // two older completed HTF candles.
+        float completedO = curO
+        float completedH = curH
+        float completedL = curL
+        float completedC = curC
+
+        bool c2Bull = not na(prevL1) and completedL < prevL1 and completedC > prevL1
+        bool c2Bear = not na(prevH1) and completedH > prevH1 and completedC < prevH1
+        bool c2BullContinuation = not na(prevL2) and prevL1 < prevL2 and prevC1 < prevL2
+        bool c2BearContinuation = not na(prevH2) and prevH1 > prevH2 and prevC1 > prevH2
+        bool c3Bull = c2BullContinuation and completedL >= prevL1 and completedC > completedO and completedC > math.max(prevO1, prevC1)
+        bool c3Bear = c2BearContinuation and completedH <= prevH1 and completedC < completedO and completedC < math.min(prevO1, prevC1)
+
+        int qualifyingHtfTime = time(refHtf)[1]
+        bool strictBullCisd = bullReclaimed[1] and not na(bullLevelHtfTime[1]) and bullLevelHtfTime[1] == qualifyingHtfTime and bullReclaimHtfTime[1] == qualifyingHtfTime
+        bool strictBearCisd = bearReclaimed[1] and not na(bearLevelHtfTime[1]) and bearLevelHtfTime[1] == qualifyingHtfTime and bearReclaimHtfTime[1] == qualifyingHtfTime
+
+        // First advance/finish any existing model. A newly confirmed model on
+        // this same boundary overrides the progressed state below.
+        if modelPhase == 1
+            modelPhase := 2
+        else if modelPhase == 2
+            modelPhase := 0
+            biasDir := 0
+            modelExtreme := na
+
+        // Match the main engine's priority: C2 first, true C3 second, so a true
+        // C3 can replace a simultaneous C2 classification on the same close.
+        if c2Bull and strictBullCisd
+            biasDir := 1
+            modelPhase := 1
+            modelExtreme := completedL
+        if c2Bear and strictBearCisd
+            biasDir := -1
+            modelPhase := 1
+            modelExtreme := completedH
+        if c3Bull and strictBullCisd
+            biasDir := 1
+            modelPhase := 2
+            modelExtreme := prevL1
+        if c3Bear and strictBearCisd
+            biasDir := -1
+            modelPhase := 2
+            modelExtreme := prevH1
+
+        prevO2 := prevO1
+        prevH2 := prevH1
+        prevL2 := prevL1
+        prevC2 := prevC1
+        prevO1 := completedO
+        prevH1 := completedH
+        prevL1 := completedL
+        prevC1 := completedC
+
+        curO := open
+        curH := high
+        curL := low
+        curC := close
+    else
+        curH := math.max(curH, high)
+        curL := math.min(curL, low)
+        curC := close
+
+    // Detect the reference LTF opposing-candle series responsible for the
+    // current reference-HTF sweep. This mirrors the strict CISD engine used by
+    // the main model, but stores no drawings.
+    bool up = close > open
+    bool dw = close < open
+    bool eq = close == open
+
+    if not na(prevL1) and low == curL and low < prevL1
+        if (dw or eq) and (close[1] > open[1] or close[1] == open[1]) and not (eq and close[1] == open[1])
+            bullLevel := open
+            bullIndex := bar_index
+        else
+            for i = 2 to 10
+                if low[i] < low
+                    break
+                bool upI = close[i] > open[i]
+                bool eqI = close[i] == open[i]
+                bool dwPrev = close[i - 1] < open[i - 1]
+                if (upI or eqI) and dwPrev
+                    int b = i - 1
+                    bullLevel := open[b]
+                    bullIndex := bar_index - b
+                    for j = b to 0
+                        if open[j] > bullLevel and close[j] < open[j]
+                            bullLevel := open[j]
+                            bullIndex := bar_index - j
+                    if bullLevel < open
+                        bullLevel := close > open ? high : open
+                        bullIndex := bar_index
+                    break
+
+    if not na(prevH1) and high == curH and high > prevH1
+        if (up or eq) and (close[1] < open[1] or close[1] == open[1]) and not (eq and close[1] == open[1])
+            bearLevel := open
+            bearIndex := bar_index
+        else
+            for i = 2 to 10
+                if high[i] > high
+                    break
+                bool dwI = close[i] < open[i]
+                bool eqI = close[i] == open[i]
+                bool upPrev = close[i - 1] > open[i - 1]
+                if (dwI or eqI) and upPrev
+                    int b = i - 1
+                    bearLevel := open[b]
+                    bearIndex := bar_index - b
+                    for j = b to 0
+                        if open[j] < bearLevel and close[j] > open[j]
+                            bearLevel := open[j]
+                            bearIndex := bar_index - j
+                    if bearLevel > open
+                        bearLevel := close < open ? low : open
+                        bearIndex := bar_index
+                    break
+
+    bool newBullLevel = not na(bullIndex) and (na(bullIndex[1]) or bullIndex != bullIndex[1])
+    if newBullLevel
+        bullReclaimed := false
+        bullReclaimHtfTime := na
+        int bullOffset = bar_index - bullIndex
+        bullLevelHtfTime := time(refHtf)[bullOffset]
+    if barstate.isconfirmed and not na(bullLevel) and not bullReclaimed and close > bullLevel
+        bullReclaimed := true
+        bullReclaimHtfTime := time(refHtf)
+
+    bool newBearLevel = not na(bearIndex) and (na(bearIndex[1]) or bearIndex != bearIndex[1])
+    if newBearLevel
+        bearReclaimed := false
+        bearReclaimHtfTime := na
+        int bearOffset = bar_index - bearIndex
+        bearLevelHtfTime := time(refHtf)[bearOffset]
+    if barstate.isconfirmed and not na(bearLevel) and not bearReclaimed and close < bearLevel
+        bearReclaimed := true
+        bearReclaimHtfTime := time(refHtf)
+
+    // Structural invalidation is evaluated throughout the active higher HTF
+    // candle. Because the engine is requested with lookahead_off, the outer
+    // chart only receives this state after the reference LTF bar closes.
+    if biasDir == 1 and not na(modelExtreme) and low < modelExtreme
+        biasDir := 0
+        modelPhase := 0
+        modelExtreme := na
+    if biasDir == -1 and not na(modelExtreme) and high > modelExtreme
+        biasDir := 0
+        modelPhase := 0
+        modelExtreme := na
+
+    biasDir
 
 method delete(HtfCandle c) =>
     box.delete(c.body)
@@ -546,6 +766,28 @@ autoTf = switch modelType
     '1D-1W'  => '1W'
     'Custom' => customHTF
     =>          autoHTF()
+
+[biasLtf1, biasHtf1] = nextBiasPair(autoTf)
+[biasLtf2, biasHtf2] = nextBiasPair(biasHtf1)
+
+isAutoBias1 = biasFilter == 'Auto Bias 1'
+isAutoBias2 = biasFilter == 'Auto Bias 2'
+selectedBiasLtf = isAutoBias1 ? biasLtf1 : isAutoBias2 ? biasLtf2 : ''
+selectedBiasHtf = isAutoBias1 ? biasHtf1 : isAutoBias2 ? biasHtf2 : ''
+
+// Evaluate only the Auto Bias level the user actually selected. This avoids
+// running two independent higher-fractal engines on every chart. lookahead_off
+// exposes only completed reference-LTF states, while calc_bars_count bounds the
+// historical workload without changing current bias behavior.
+int selectedAutoBiasDir = 0
+if (isAutoBias1 or isAutoBias2) and selectedBiasLtf != '' and selectedBiasHtf != ''
+    selectedAutoBiasDir := request.security(syminfo.tickerid, selectedBiasLtf, fractalBiasEngine(selectedBiasHtf), lookahead = barmerge.lookahead_off, calc_bars_count = 300)
+
+// Manual behavior remains unchanged. Auto modes permit setups only when an
+// active higher-fractal model exists in the same direction; neutral auto bias
+// intentionally suppresses both sides.
+allowBuy = biasFilter == 'Neutral' or biasFilter == 'Bullish' or ((isAutoBias1 or isAutoBias2) and selectedAutoBiasDir == 1)
+allowSell = biasFilter == 'Neutral' or biasFilter == 'Bearish' or ((isAutoBias1 or isAutoBias2) and selectedAutoBiasDir == -1)
 
 validTf = modelType == 'Auto' ? isAutoValidTf(tfMins(curTfCode())) : tfMins(curTfCode()) <= tfMins(ltfCode())
 
@@ -1078,7 +1320,10 @@ if barstate.islast and boolTable
 
     table.cell(wm, 0, 0, 'Open Source Fractal', text_color = dashBgColor, bgcolor = dashTextColor, text_size = size.normal, text_halign = text.align_center, text_font_family = font.family_default)
 
-    alignBiasStr = 'Alignment : ' + ltfDisp + '-' + htfDisp + '\n\nBias : ' + biasFilter
+    autoBiasDirStr = selectedAutoBiasDir == 1 ? 'Bullish' : selectedAutoBiasDir == -1 ? 'Bearish' : 'Neutral'
+    autoBiasRefStr = selectedBiasLtf != '' and selectedBiasHtf != '' ? tfLabel(selectedBiasLtf) + '-' + tfLabel(selectedBiasHtf) : 'Unavailable'
+    biasDisp = (isAutoBias1 or isAutoBias2) ? biasFilter + ' → ' + autoBiasDirStr + '\nRef : ' + autoBiasRefStr : biasFilter
+    alignBiasStr = 'Alignment : ' + ltfDisp + '-' + htfDisp + '\n\nBias : ' + biasDisp
     table.cell(wm, 0, 1, alignBiasStr, text_color = dashTextColor, bgcolor = dashBgColor, text_size = size.small, text_halign = text.align_center, text_font_family = font.family_default)
 
     dateStr     = str.format_time(time_close, 'dd MMM yyyy', syminfo.timezone)
