@@ -71,6 +71,11 @@ showTSpot      = input.bool(true, 'T-Spot Box', group = grpVisuals, inline = 'ts
 tSpotBullColor = input.color(color.new(color.green, 80), '', group = grpVisuals, inline = 'tspot')
 tSpotBearColor = input.color(color.new(color.gray, 80), '', group = grpVisuals, inline = 'tspot')
 
+showIdealFormation = input.bool(true, 'Ideal Formation', group = grpVisuals, inline = 'ideal')
+showIdealLevel     = input.bool(true, 'PS Confirm Level', group = grpVisuals, inline = 'ideal')
+idealBullColor     = input.color(color.new(color.green, 0), '', group = grpVisuals, inline = 'ideal')
+idealBearColor     = input.color(color.new(color.red, 0), '', group = grpVisuals, inline = 'ideal')
+
 grpStdDev   = 'Deviations'
 showStdDev  = input.bool(false, 'Enable Projections?', group = grpStdDev, inline = 'stdb')
 stdDevInput = input.string('-1,-2,-3', '', group = grpStdDev, inline = 'stdb', active = showStdDev)
@@ -111,6 +116,7 @@ type HtfCandle
     bool  triggerSell = false
 
 type PeriodState
+    float prevOpen        = na
     float prevHigh        = na
     float prevLow         = na
     float prevClose       = na
@@ -162,6 +168,13 @@ type C2Setup
     int   c4StartBar        = na
     float c3Top             = na
     float c3Bottom          = na
+    // --- Ideal Formation / protected swing bookkeeping ---
+    float protectedLevel    = na   // opening price of opposing HTF candle series
+    bool  idealFormation    = false
+    int   idealCandle       = na   // 2 or 3
+    int   idealMarkBar      = na
+    line  protectedLine     = na
+    label idealLabel        = na
 
 type SetupRecord
     C2Setup setup
@@ -448,6 +461,10 @@ deleteSetupVisuals(C2Setup s) =>
             line.delete(s.c4Dash)
         if not na(s.c4Lbl)
             label.delete(s.c4Lbl)
+        if not na(s.protectedLine)
+            line.delete(s.protectedLine)
+        if not na(s.idealLabel)
+            label.delete(s.idealLabel)
         if not na(s.stdDevData)
             if not na(s.stdDevData.lines)
                 for ln in s.stdDevData.lines
@@ -465,6 +482,60 @@ registerRecord(C2Setup s) =>
     pruneEarlyCisd(bullEarlyCisdRecords, earliestVisibleBar)
     pruneEarlyCisd(bearEarlyCisdRecords, earliestVisibleBar)
 
+// Returns the opening-price level of the opposing HTF candle series that
+// produced a swept swing. This mirrors the protected-swing concept used by
+// TTFM: bullish swings must close above the down-close series; bearish swings
+// must close below the up-close series. swingOffset=0 is the current HTF
+// closure candle (C2); swingOffset=1 is the prior HTF candle (the swept C2
+// when a true C3 closure is being evaluated).
+protectedSeriesLevel(bool isBull, int swingOffset) =>
+    float level = na
+    if isBull
+        swingLow = low[swingOffset]
+        swingDw  = close[swingOffset] < open[swingOffset]
+        swingEq  = close[swingOffset] == open[swingOffset]
+        prevUp   = close[swingOffset + 1] > open[swingOffset + 1]
+        prevEq   = close[swingOffset + 1] == open[swingOffset + 1]
+        if (swingDw or swingEq) and (prevUp or prevEq) and not (swingEq and prevEq)
+            level := open[swingOffset]
+        else
+            for i = swingOffset + 2 to swingOffset + 10
+                if low[i] < swingLow
+                    break
+                upI     = close[i] > open[i]
+                eqI     = close[i] == open[i]
+                downPrev = close[i - 1] < open[i - 1]
+                if (upI or eqI) and downPrev
+                    b = i - 1
+                    level := open[b]
+                    for j = swingOffset to b
+                        if close[j] < open[j] and open[j] > level
+                            level := open[j]
+                    break
+    else
+        swingHigh = high[swingOffset]
+        swingUp   = close[swingOffset] > open[swingOffset]
+        swingEq   = close[swingOffset] == open[swingOffset]
+        prevDw    = close[swingOffset + 1] < open[swingOffset + 1]
+        prevEq    = close[swingOffset + 1] == open[swingOffset + 1]
+        if (swingUp or swingEq) and (prevDw or prevEq) and not (swingEq and prevEq)
+            level := open[swingOffset]
+        else
+            for i = swingOffset + 2 to swingOffset + 10
+                if high[i] > swingHigh
+                    break
+                downI  = close[i] < open[i]
+                eqI    = close[i] == open[i]
+                upPrev = close[i - 1] > open[i - 1]
+                if (downI or eqI) and upPrev
+                    b = i - 1
+                    level := open[b]
+                    for j = swingOffset to b
+                        if close[j] > open[j] and open[j] < level
+                            level := open[j]
+                    break
+    level
+
 autoTf = switch modelType
     '1m-15m' => '15'
     '3m-30m' => '30'
@@ -479,6 +550,10 @@ autoTf = switch modelType
 validTf = modelType == 'Auto' ? isAutoValidTf(tfMins(curTfCode())) : tfMins(curTfCode()) <= tfMins(ltfCode())
 
 [currentO, currentH, currentL, currentC, prevO1, prevH1, prevL1, prevC1, prevO2, prevH2, prevL2, prevC2] = request.security(syminfo.tickerid, autoTf, [open[0], high[0], low[0], close[0], open[1], high[1], low[1], close[1], open[2], high[2], low[2], close[2]], lookahead = barmerge.lookahead_on)
+
+// Protected-series levels are calculated in the HTF context. C2 uses the
+// current HTF candle as the swept swing; true C3 uses the prior HTF C2 swing.
+[bullProtectedC2, bearProtectedC2, bullProtectedC3, bearProtectedC3] = request.security(syminfo.tickerid, autoTf, [protectedSeriesLevel(true, 0), protectedSeriesLevel(false, 0), protectedSeriesLevel(true, 1), protectedSeriesLevel(false, 1)], lookahead = barmerge.lookahead_on)
 
 c2Buy         = currentL < prevL1 and currentC > prevL1
 c2Sell        = currentH > prevH1 and currentC < prevH1
@@ -517,6 +592,25 @@ drawPhaseVisual(bool isBull, bool isC4, int startBar, float top, float bot, bool
         lbl := directionalLabel(startBar + 2, isBull ? bot : top, 'C4', isBull)
     [bx, dash, lbl]
 
+method drawIdeal(C2Setup s) =>
+    if s.idealFormation and s.revealed and showIdealFormation and not na(s.protectedLevel)
+        clr = s.isBull ? idealBullColor : idealBearColor
+        if showIdealLevel and na(s.protectedLine)
+            s.protectedLine := line.new(s.idealMarkBar, s.protectedLevel, bar_index, s.protectedLevel, xloc = xloc.bar_index, color = clr, width = 2)
+        if showLabels and validTf and na(s.idealLabel)
+            txt = 'IF C' + str.tostring(s.idealCandle)
+            s.idealLabel := label.new(s.idealMarkBar, s.protectedLevel, txt, xloc = xloc.bar_index, style = s.isBull ? label.style_label_up : label.style_label_down, color = na, textcolor = clr, size = textSize(labelSize), text_font_family = font.family_monospace)
+    s
+
+method markIdeal(C2Setup s, int candleNo, int markBar) =>
+    if not s.idealFormation and not na(s.protectedLevel)
+        s.idealFormation := true
+        s.idealCandle    := candleNo
+        s.idealMarkBar   := markBar
+        if s.revealed
+            s.drawIdeal()
+    s
+
 // CISD reveal now controls confirmation labels/sweep only. T-Spot phase
 // visuals are intentionally created at the confirmed HTF boundary so they
 // never appear retroactively after CISD confirms.
@@ -530,9 +624,10 @@ method reveal(C2Setup s) =>
             drawSweepLine(s.sweepFromBar, s.sweepFromPrice, bar_index)
         if s.phase == 2 and not na(s.c4StartBar) and na(s.c4Lbl) and showTSpot and showLabels and validTf
             s.c4Lbl := directionalLabel(s.c4StartBar + 2, s.isBull ? s.c4Bottom : s.c4Top, 'C4', s.isBull)
+        s.drawIdeal()
     s
 
-newSetup(bool isBull, int closureCandle, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar) =>
+newSetup(bool isBull, int closureCandle, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure) =>
     startPhase = closureCandle == 3 ? 2 : 1
     s = C2Setup.new(isBull, invalidationExtreme, startPhase, false, closureCandle)
     s.c2Bar          := closureBar
@@ -558,8 +653,13 @@ newSetup(bool isBull, int closureCandle, float invalidationExtreme, int closureB
         [bx3, dash3, _] = drawPhaseVisual(isBull, false, s.c3StartBar, top, bot, false)
         s.c3Box  := bx3
         s.c3Dash := dash3
-    s.cisdLevel  := cisdLevel
-    s.cisdIndex  := cisdIndex
+    s.cisdLevel      := cisdLevel
+    s.cisdIndex      := cisdIndex
+    s.protectedLevel := protectedLevel
+    if idealAtClosure
+        s.idealFormation := true
+        s.idealCandle    := closureCandle
+        s.idealMarkBar   := bar_index
     cisdReady = cisdAlreadyConfirmed and not na(cisdLevel) and not na(cisdIndex) and not na(cisdConfirmBar)
     if not requireCisdToShow
         // legacy behavior: always visible immediately
@@ -577,6 +677,14 @@ method advanceToC4(C2Setup s) =>
     if not na(s.c3Dash)
         line.set_x2(s.c3Dash, bar_index)
     s.c4StartBar := bar_index
+    // A valid C2 can become Ideal on C3 when C3 completes the protected-swing
+    // break through the stored opposing-series opening level. This is distinct
+    // from a true C3 closure: the original C2 reversal remains the active model.
+    if not s.idealFormation and not na(s.protectedLevel)
+        directionalC3 = s.isBull ? state.prevClose > state.prevOpen : state.prevClose < state.prevOpen
+        protectsSwing = s.isBull ? state.prevClose > s.protectedLevel : state.prevClose < s.protectedLevel
+        if directionalC3 and protectsSwing
+            s.markIdeal(3, bar_index)
     // At the C4 boundary state.prev* is the now-completed C3 candle.
     [top, bot] = computeTSpot(s.isBull, state.prevHigh, state.prevLow, state.prevClose)
     s.c4Top    := top
@@ -616,6 +724,8 @@ method extendAndCheck(C2Setup s) =>
             box.set_right(extBox, bar_index)
         if not na(extDash)
             line.set_x2(extDash, bar_index)
+        if not na(s.protectedLine)
+            line.set_x2(s.protectedLine, bar_index)
 
         closureBreach = s.isBull ? low < s.extreme : high > s.extreme
         if closureBreach
@@ -655,10 +765,10 @@ method checkC4Invalid(C2Setup s) =>
                 line.set_color(s.c4Dash, color.red)
     s
 
-processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extremeBar, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, C2Setup existing) =>
+processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extremeBar, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure, C2Setup existing) =>
     C2Setup result = existing
     if trigger and allow
-        result := newSetup(isBull, 2, extremePrice, extremeBar, extremePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar)
+        result := newSetup(isBull, 2, extremePrice, extremeBar, extremePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar, protectedLevel, idealAtClosure)
     else if periodChanged and not na(existing) and not existing.dead
         result := existing.phase == 1 ? existing.advanceToC4() : existing.phase == 2 ? existing.finish() : existing
     result
@@ -666,10 +776,10 @@ processC2(bool trigger, bool allow, bool isBull, float extremePrice, int extreme
 // Creates a distinct Candle 3 Closure setup. Unlike processC2(), this does
 // not advance an existing setup: it only replaces it when a true C3 closure
 // has just completed. A C3 closure starts directly in the C4 phase.
-processC3(bool trigger, bool allow, bool isBull, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, C2Setup existing) =>
+processC3(bool trigger, bool allow, bool isBull, float invalidationExtreme, int closureBar, float closurePrice, float sweepFromPrice, int sweepFromBar, float cisdLevel, int cisdIndex, bool cisdAlreadyConfirmed, int cisdConfirmBar, float protectedLevel, bool idealAtClosure, C2Setup existing) =>
     C2Setup result = existing
     if trigger and allow
-        result := newSetup(isBull, 3, invalidationExtreme, closureBar, closurePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar)
+        result := newSetup(isBull, 3, invalidationExtreme, closureBar, closurePrice, sweepFromPrice, sweepFromBar, cisdLevel, cisdIndex, cisdAlreadyConfirmed, cisdConfirmBar, protectedLevel, idealAtClosure)
     result
 
 markTrigger(bool trigger, bool allow, int idx, bool isBuy) =>
@@ -802,6 +912,7 @@ candleOffset = candleOffsetIn + 10
 if periodChanged
     if htfCandles.size() > 0
         newest             = htfCandles.first()
+        state.prevOpen    := newest.o
         state.prevHigh    := newest.h
         state.prevLow     := newest.l
         state.prevClose   := newest.c
@@ -864,20 +975,32 @@ bearSetupCisdLevel = bearStrictCisd ? bearLevelFixed[1] : na
 bearSetupCisdIndex = bearStrictCisd ? bearIndexFixed[1] : na
 bearSetupCisdBar   = bearStrictCisd ? bearReclaimBar[1] : na
 
+// Freeze the protected-swing series level from the just-completed HTF candle.
+// C2 stores this even when it is not yet Ideal so C3 can complete the break.
+bullC2ProtectedLevel = c2BuyTrigger  ? bullProtectedC2[1] : na
+bearC2ProtectedLevel = c2SellTrigger ? bearProtectedC2[1] : na
+bullC3ProtectedLevel = c3BuyTrigger  ? bullProtectedC3[1] : na
+bearC3ProtectedLevel = c3SellTrigger ? bearProtectedC3[1] : na
+
+c2BuyIdeal  = c2BuyTrigger  and state.prevClose > state.prevOpen and not na(bullC2ProtectedLevel) and state.prevClose > bullC2ProtectedLevel
+c2SellIdeal = c2SellTrigger and state.prevClose < state.prevOpen and not na(bearC2ProtectedLevel) and state.prevClose < bearC2ProtectedLevel
+c3BuyIdeal  = c3BuyTrigger  and not na(bullC3ProtectedLevel) and state.prevClose > bullC3ProtectedLevel
+c3SellIdeal = c3SellTrigger and not na(bearC3ProtectedLevel) and state.prevClose < bearC3ProtectedLevel
+
 if (c2BuyTrigger or c3BuyTrigger) and allowBuy and bullStrictCisd
     consumeLastEarlyCisd(bullEarlyCisdRecords)
 
 if (c2SellTrigger or c3SellTrigger) and allowSell and bearStrictCisd
     consumeLastEarlyCisd(bearEarlyCisdRecords)
 
-buySetup  := processC2(c2BuyTrigger, allowBuy, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, buySetup)
-sellSetup := processC2(c2SellTrigger, allowSell, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, sellSetup)
+buySetup  := processC2(c2BuyTrigger, allowBuy, true, state.prevLow, state.prevLowBar, state.prevPrevLow, state.prevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC2ProtectedLevel, c2BuyIdeal, buySetup)
+sellSetup := processC2(c2SellTrigger, allowSell, false, state.prevHigh, state.prevHighBar, state.prevPrevHigh, state.prevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC2ProtectedLevel, c2SellIdeal, sellSetup)
 
 // A true C3 closure uses Candle 2's extreme as the structural invalidation,
 // labels Candle 3 itself, and immediately opens the Candle 4 continuation
 // phase. Candle 1 remains the sweep/reference level for the formation.
-buySetup  := processC3(c3BuyTrigger, allowBuy, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, buySetup)
-sellSetup := processC3(c3SellTrigger, allowSell, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, sellSetup)
+buySetup  := processC3(c3BuyTrigger, allowBuy, true, prevL1[1], state.prevLowBar, currentL[1], prevL2[1], state.prevPrevPrevLowBar, bullSetupCisdLevel, bullSetupCisdIndex, bullStrictCisd, bullSetupCisdBar, bullC3ProtectedLevel, c3BuyIdeal, buySetup)
+sellSetup := processC3(c3SellTrigger, allowSell, false, prevH1[1], state.prevHighBar, currentH[1], prevH2[1], state.prevPrevPrevHighBar, bearSetupCisdLevel, bearSetupCisdIndex, bearStrictCisd, bearSetupCisdBar, bearC3ProtectedLevel, c3SellIdeal, sellSetup)
 
 markTrigger(c2BuyTrigger, allowBuy, 2, true)
 markTrigger(c2SellTrigger, allowSell, 2, false)
